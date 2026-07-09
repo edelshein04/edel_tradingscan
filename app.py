@@ -26,6 +26,10 @@ data = response.json()
 
 st.subheader(f"Velas diarias OHLCV: {ticker}")
 
+st.write("Status code:", response.status_code)
+st.write("Respuesta Finnhub:")
+st.json(data)
+
 if data.get("s") == "ok":
     df = pd.DataFrame({
         "Date": pd.to_datetime(data["t"], unit="s"),
@@ -34,6 +38,11 @@ if data.get("s") == "ok":
         "Low": data["l"],
         "Close": data["c"],
         "Volume": data["v"]
+    })
+
+    st.dataframe(df.tail(20), use_container_width=True)
+else:
+    st.error("No se pudieron obtener datos.")
     })
 
     st.dataframe(df.tail(20), use_container_width=True)
