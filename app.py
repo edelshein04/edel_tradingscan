@@ -3,16 +3,20 @@ import requests
 import pandas as pd
 from datetime import datetime, timedelta, timezone
 
+st.set_page_config(page_title="Finnhub Swing Scanner", layout="wide")
+
 st.title("Finnhub Swing Scanner")
+st.write("Paso 4: descargar velas diarias OHLCV desde Finnhub")
 
 api_key = st.secrets["FINNHUB_API_KEY"]
 
-ticker = st.text_input("Ticker", "NVDA").upper()
+ticker = st.text_input("Ticker", "NVDA").upper().strip()
 
 to_ts = int(datetime.now(timezone.utc).timestamp())
 from_ts = int((datetime.now(timezone.utc) - timedelta(days=220)).timestamp())
 
 url = "https://finnhub.io/api/v1/stock/candle"
+
 params = {
     "symbol": ticker,
     "resolution": "D",
@@ -24,10 +28,9 @@ params = {
 response = requests.get(url, params=params)
 data = response.json()
 
-st.subheader(f"Velas diarias OHLCV: {ticker}")
+st.subheader(f"Respuesta de Finnhub para {ticker}")
 
 st.write("Status code:", response.status_code)
-st.write("Respuesta Finnhub:")
 st.json(data)
 
 if data.get("s") == "ok":
@@ -40,12 +43,8 @@ if data.get("s") == "ok":
         "Volume": data["v"]
     })
 
+    st.subheader(f"Velas diarias OHLCV: {ticker}")
     st.dataframe(df.tail(20), use_container_width=True)
-else:
-    st.error("No se pudieron obtener datos.")
-    })
 
-    st.dataframe(df.tail(20), use_container_width=True)
 else:
-    st.error("No se pudieron obtener datos.")
-    st.json(data)
+    st.error("No se pudieron obtener datos de velas.")
