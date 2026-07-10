@@ -1,7 +1,10 @@
+import io
 import time
+from datetime import datetime
 
 import numpy as np
 import pandas as pd
+import requests
 import streamlit as st
 import yfinance as yf
 
@@ -11,20 +14,36 @@ import yfinance as yf
 # ============================================================
 
 st.set_page_config(
-    page_title="Swing Trading Scanner",
+    page_title="Nasdaq + S&P 500 Swing Scanner",
     page_icon="📈",
     layout="wide"
 )
 
-st.title("📈 Swing Trading Scanner")
+st.title("📈 Nasdaq + S&P 500 Swing Scanner")
+
 st.caption(
-    "Scanner para operaciones de 3 a 10 días con análisis diario "
-    "y confirmaciones intradía de 4H y 1H."
+    "Scanner para swing trading de 3 a 10 días. "
+    "Utiliza análisis diario y confirmaciones intradía 4H y 1H."
 )
 
 
 # ============================================================
-# CONFIGURACIÓN DE LA ESTRATEGIA
+# FUENTES DEL UNIVERSO
+# ============================================================
+
+NASDAQ_SYMBOL_URL = (
+    "https://ftp.nasdaqtrader.com/"
+    "SymbolDirectory/nasdaqlisted.txt"
+)
+
+SP500_URL = (
+    "https://en.wikipedia.org/wiki/"
+    "List_of_S%26P_500_companies"
+)
+
+
+# ============================================================
+# PONDERACIONES
 # ============================================================
 
 PESO_TENDENCIA = 25
@@ -35,33 +54,34 @@ PESO_PRECIO = 10
 PESO_4H = 10
 PESO_1H = 5
 
-TICKERS_PREDETERMINADOS = [
-    "AAPL",
-    "MSFT",
-    "NVDA",
-    "AMD",
-    "META",
-    "AMZN",
-    "GOOGL",
-    "TSLA",
-    "NFLX",
-    "AVGO",
-    "PLTR",
-    "COIN",
-    "CRM",
-    "ORCL",
-    "QCOM",
-    "MU"
-]
-
 
 # ============================================================
-# FUNCIONES DE DATOS
+# FUNCIONES GENERALES
 # ============================================================
+
+def dividir_lista(lista, tamano):
+    """
+    Divide una lista en grupos más pequeños.
+    """
+
+    for posicion in range(0, len(lista), tamano):
+        yield lista[posicion:posicion + tamano]
+
+
+def normalizar_ticker_yahoo(ticker):
+    """
+    Yahoo Finance utiliza guion para ciertas clases de acciones.
+
+    Ejemplo:
+    BRK.B -> BRK-B
+    """
+
+    return str(ticker).strip().upper().replace(".", "-")
+
 
 def limpiar_columnas_yfinance(df):
     """
-    Corrige las columnas MultiIndex que puede devolver yfinance.
+    Corrige columnas y convierte OHLCV a valores numéricos.
     """
 
     if df is None or df.empty:
@@ -69,57 +89,178 @@ def limpiar_columnas_yfinance(df):
 
     df = df.copy()
 
-    if isinstance(df.columns, pd.MultiIndex):
-        df.columns = df.columns.get_level_values(0)
+    columnas_numericas = [
+        "Open",
+        "High",
+        "Low",
+        "Close",
+        "Volume"
+    ]
+
+    for columna in columnas_numericas:
+        if columna in df.columns:
+            df[columna] = pd.to_numeric(
+                df[columna],
+                errors="coerce"
+            )
 
     return df
 
 
-@st.cache_data(ttl=900, show_spinner=False)
-def descargar_datos(ticker):
+# ============================================================
+# UNIVERSO NASDAQ
+# ============================================================
+
+@st.cache_data(ttl=21600, show_spinner=False)
+def obtener_nasdaq():
     """
-    Descarga datos diarios y datos de una hora.
-    El caché dura 15 minutos.
+    Obtiene el directorio oficial de valores listados en Nasdaq.
+    Excluye ETF y símbolos de prueba.
     """
 
-    diario = yf.download(
-        ticker,
-        period="1y",
-        interval="1d",
-        auto_adjust=True,
-        progress=False,
-        threads=False
+    headers = {
+        "User-Agent": "Mozilla/5.0"
+    }
+
+    response = requests.get(
+        NASDAQ_SYMBOL_URL,
+        headers=headers,
+        timeout=30
     )
 
-    una_hora = yf.download(
-        ticker,
-        period="60d",
-        interval="1h",
-        auto_adjust=True,
-        prepost=False,
-        progress=False,
-        threads=False
+    response.raise_for_status()
+
+    contenido = response.text
+
+    nasdaq = pd.read_csv(
+        io.StringIO(contenido),
+        sep="|"
     )
 
-    diario = limpiar_columnas_yfinance(diario)
-    una_hora = limpiar_columnas_yfinance(una_hora)
+    nasdaq["Symbol"] = (
+        nasdaq["Symbol"]
+        .astype(str)
+        .str.strip()
+    )
 
-    if not diario.empty:
-        diario = diario.reset_index()
+    # Eliminar línea final del archivo
+    nasdaq = nasdaq[
+        ~nasdaq["Symbol"].str.contains(
+            "File Creation Time",
+            na=False
+        )
+    ].copy()
 
-    if not una_hora.empty:
-        una_hora = una_hora.reset_index()
+    # Excluir ETF
+    if "ETF" in nasdaq.columns:
+        nasdaq = nasdaq[
+            nasdaq["ETF"].astype(str).str.upper() == "N"
+        ].copy()
 
-    return diario, una_hora
+    # Excluir símbolos de prueba
+    if "Test Issue" in nasdaq.columns:
+        nasdaq = nasdaq[
+            nasdaq["Test Issue"].astype(str).str.upper() == "N"
+        ].copy()
+
+    # Excluir símbolos incompatibles o especiales
+    nasdaq = nasdaq[
+        nasdaq["Symbol"].str.match(
+            r"^[A-Z]{1,5}$",
+            na=False
+        )
+    ].copy()
+
+    resultado = pd.DataFrame({
+        "Ticker original": nasdaq["Symbol"],
+        "Ticker": nasdaq["Symbol"].apply(
+            normalizar_ticker_yahoo
+        ),
+        "Empresa": nasdaq["Security Name"],
+        "Origen": "Nasdaq"
+    })
+
+    return resultado.drop_duplicates(
+        subset=["Ticker"]
+    ).reset_index(drop=True)
 
 
 # ============================================================
-# FUNCIONES DE INDICADORES
+# UNIVERSO S&P 500
+# ============================================================
+
+@st.cache_data(ttl=21600, show_spinner=False)
+def obtener_sp500():
+    """
+    Obtiene la tabla pública de constituyentes del S&P 500.
+    """
+
+    tablas = pd.read_html(
+        SP500_URL
+    )
+
+    sp500 = tablas[0].copy()
+
+    resultado = pd.DataFrame({
+        "Ticker original": sp500["Symbol"],
+        "Ticker": sp500["Symbol"].apply(
+            normalizar_ticker_yahoo
+        ),
+        "Empresa": sp500["Security"],
+        "Origen": "S&P 500"
+    })
+
+    return resultado.drop_duplicates(
+        subset=["Ticker"]
+    ).reset_index(drop=True)
+
+
+# ============================================================
+# UNIVERSO COMBINADO
+# ============================================================
+
+@st.cache_data(ttl=21600, show_spinner=False)
+def obtener_universo():
+    """
+    Combina Nasdaq y S&P 500 y conserva el origen de cada ticker.
+    """
+
+    nasdaq = obtener_nasdaq()
+    sp500 = obtener_sp500()
+
+    universo = pd.concat(
+        [nasdaq, sp500],
+        ignore_index=True
+    )
+
+    universo = (
+        universo.groupby(
+            "Ticker",
+            as_index=False
+        )
+        .agg({
+            "Ticker original": "first",
+            "Empresa": "first",
+            "Origen": lambda valores: " + ".join(
+                sorted(set(valores))
+            )
+        })
+    )
+
+    universo = universo.sort_values(
+        "Ticker"
+    ).reset_index(drop=True)
+
+    return universo
+
+
+# ============================================================
+# INDICADORES
 # ============================================================
 
 def calcular_rsi(close, periodo=14):
     """
-    Calcula RSI utilizando suavizado exponencial tipo Wilder.
+    RSI con suavizado exponencial tipo Wilder.
     """
 
     delta = close.diff()
@@ -137,7 +278,10 @@ def calcular_rsi(close, periodo=14):
         adjust=False
     ).mean()
 
-    rs = promedio_ganancias / promedio_perdidas.replace(0, np.nan)
+    rs = (
+        promedio_ganancias
+        / promedio_perdidas.replace(0, np.nan)
+    )
 
     rsi = 100 - (100 / (1 + rs))
 
@@ -146,27 +290,23 @@ def calcular_rsi(close, periodo=14):
 
 def calcular_indicadores(df):
     """
-    Calcula todos los indicadores utilizados por la estrategia.
+    Calcula todos los indicadores de la tesis.
     """
 
     if df.empty:
         return pd.DataFrame()
 
-    df = df.copy()
+    df = limpiar_columnas_yfinance(df)
 
-    columnas_requeridas = [
-        "Open",
-        "High",
-        "Low",
-        "Close",
-        "Volume"
-    ]
-
-    for columna in columnas_requeridas:
-        df[columna] = pd.to_numeric(
-            df[columna],
-            errors="coerce"
-        )
+    df = df.dropna(
+        subset=[
+            "Open",
+            "High",
+            "Low",
+            "Close",
+            "Volume"
+        ]
+    ).copy()
 
     # EMAs
     df["EMA10"] = df["Close"].ewm(
@@ -212,14 +352,23 @@ def calcular_indicadores(df):
         df["MACD"] - df["MACD_SIGNAL"]
     )
 
-    # Volumen relativo
-    df["VOL_AVG20"] = df["Volume"].rolling(20).mean()
-
-    df["VOL_REL"] = (
-        df["Volume"] / df["VOL_AVG20"]
+    # Volumen
+    df["VOL_AVG20"] = (
+        df["Volume"]
+        .rolling(20)
+        .mean()
     )
 
-    # Máximos y mínimos previos de 10 velas
+    df["VOL_REL"] = (
+        df["Volume"]
+        / df["VOL_AVG20"]
+    )
+
+    df["DOLLAR_VOL_AVG20"] = (
+        df["Close"] * df["Volume"]
+    ).rolling(20).mean()
+
+    # Máximos y mínimos previos
     df["HIGH_10"] = (
         df["High"]
         .rolling(10)
@@ -234,8 +383,10 @@ def calcular_indicadores(df):
         .shift(1)
     )
 
-    # True Range y ATR14
-    rango_max_min = df["High"] - df["Low"]
+    # ATR
+    rango_max_min = (
+        df["High"] - df["Low"]
+    )
 
     max_cierre_anterior = (
         df["High"] - df["Close"].shift(1)
@@ -254,346 +405,267 @@ def calcular_indicadores(df):
         axis=1
     ).max(axis=1)
 
-    df["ATR14"] = df["TRUE_RANGE"].rolling(14).mean()
+    df["ATR14"] = (
+        df["TRUE_RANGE"]
+        .rolling(14)
+        .mean()
+    )
 
     df["ATR_PCT"] = (
-        df["ATR14"] / df["Close"]
+        df["ATR14"]
+        / df["Close"]
     ) * 100
 
     return df
 
 
-def convertir_1h_a_4h(df_1h):
+# ============================================================
+# EXTRAER TICKER DE DESCARGA MÚLTIPLE
+# ============================================================
+
+def extraer_ticker_del_lote(datos_lote, ticker, total_tickers):
     """
-    Agrupa las velas de una hora en bloques de aproximadamente
-    cuatro horas dentro de cada sesión bursátil.
+    Extrae el DataFrame correspondiente a un ticker.
     """
 
-    if df_1h.empty:
+    if datos_lote is None or datos_lote.empty:
         return pd.DataFrame()
 
-    df = df_1h.copy()
+    try:
 
-    if "Datetime" in df.columns:
-        columna_fecha = "Datetime"
+        if isinstance(
+            datos_lote.columns,
+            pd.MultiIndex
+        ):
 
-    elif "Date" in df.columns:
-        columna_fecha = "Date"
+            nivel_cero = list(
+                datos_lote.columns.get_level_values(0)
+            )
 
-    else:
+            nivel_uno = list(
+                datos_lote.columns.get_level_values(1)
+            )
+
+            if ticker in nivel_cero:
+                df = datos_lote[ticker].copy()
+
+            elif ticker in nivel_uno:
+                df = datos_lote.xs(
+                    ticker,
+                    axis=1,
+                    level=1
+                ).copy()
+
+            else:
+                return pd.DataFrame()
+
+        elif total_tickers == 1:
+            df = datos_lote.copy()
+
+        else:
+            return pd.DataFrame()
+
+        df = limpiar_columnas_yfinance(df)
+
+        return df.dropna(
+            how="all"
+        )
+
+    except Exception:
         return pd.DataFrame()
-
-    df[columna_fecha] = pd.to_datetime(
-        df[columna_fecha],
-        errors="coerce"
-    )
-
-    df = df.dropna(
-        subset=[columna_fecha]
-    )
-
-    df["SESSION_DATE"] = df[columna_fecha].dt.date
-
-    df["ORDEN_SESION"] = (
-        df.groupby("SESSION_DATE")
-        .cumcount()
-    )
-
-    df["BLOQUE_4H"] = (
-        df["ORDEN_SESION"] // 4
-    )
-
-    df_4h = (
-        df.groupby(
-            [
-                "SESSION_DATE",
-                "BLOQUE_4H"
-            ],
-            as_index=False
-        )
-        .agg(
-            Datetime=(columna_fecha, "first"),
-            Open=("Open", "first"),
-            High=("High", "max"),
-            Low=("Low", "min"),
-            Close=("Close", "last"),
-            Volume=("Volume", "sum")
-        )
-    )
-
-    return df_4h
 
 
 # ============================================================
-# FUNCIONES DE PUNTUACIÓN
+# DESCARGA DIARIA EN LOTES
 # ============================================================
 
-def analizar_ticker(ticker):
+@st.cache_data(ttl=21600, show_spinner=False)
+def descargar_lote_diario(tickers):
     """
-    Analiza un ticker y devuelve una fila con sus resultados.
+    Descarga un lote de tickers con velas diarias.
     """
 
-    df_diario, df_1h = descargar_datos(ticker)
+    tickers = list(tickers)
 
-    if df_diario.empty:
-        raise ValueError("Sin datos diarios")
-
-    if df_1h.empty:
-        raise ValueError("Sin datos de 1H")
-
-    df_4h = convertir_1h_a_4h(df_1h)
-
-    if df_4h.empty:
-        raise ValueError("No fue posible calcular las velas 4H")
-
-    df_diario = calcular_indicadores(df_diario)
-    df_1h = calcular_indicadores(df_1h)
-    df_4h = calcular_indicadores(df_4h)
-
-    df_diario = df_diario.dropna().reset_index(drop=True)
-    df_1h = df_1h.dropna().reset_index(drop=True)
-    df_4h = df_4h.dropna().reset_index(drop=True)
-
-    if len(df_diario) < 60:
-        raise ValueError("Datos diarios insuficientes")
-
-    if len(df_1h) < 50:
-        raise ValueError("Datos 1H insuficientes")
-
-    if len(df_4h) < 50:
-        raise ValueError("Datos 4H insuficientes")
-
-    actual_d = df_diario.iloc[-1]
-    anterior_d = df_diario.iloc[-2]
-    anterior_2d = df_diario.iloc[-3]
-
-    actual_1h = df_1h.iloc[-1]
-    actual_4h = df_4h.iloc[-1]
-
-    # --------------------------------------------------------
-    # VALORES DIARIOS
-    # --------------------------------------------------------
-
-    precio = float(actual_d["Close"])
-
-    ema10_d = float(actual_d["EMA10"])
-    ema20_d = float(actual_d["EMA20"])
-    ema50_d = float(actual_d["EMA50"])
-
-    rsi_d = float(actual_d["RSI14"])
-
-    macd_d = float(actual_d["MACD"])
-    signal_d = float(actual_d["MACD_SIGNAL"])
-    hist_d = float(actual_d["MACD_HIST"])
-
-    hist_d_anterior = float(
-        anterior_d["MACD_HIST"]
+    datos = yf.download(
+        tickers=tickers,
+        period="1y",
+        interval="1d",
+        auto_adjust=True,
+        group_by="ticker",
+        progress=False,
+        threads=True,
+        timeout=30
     )
 
-    hist_d_anterior_2 = float(
-        anterior_2d["MACD_HIST"]
+    return datos
+
+
+# ============================================================
+# SCORE DIARIO
+# ============================================================
+
+def analizar_diario(
+    ticker,
+    empresa,
+    origen,
+    df,
+    precio_minimo,
+    volumen_minimo,
+    dollar_volume_minimo
+):
+    """
+    Aplica filtros de liquidez y calcula score diario /85.
+    """
+
+    if df.empty or len(df) < 100:
+        return None
+
+    df = calcular_indicadores(df)
+
+    df = df.dropna().copy()
+
+    if len(df) < 60:
+        return None
+
+    actual = df.iloc[-1]
+    anterior = df.iloc[-2]
+    anterior_2 = df.iloc[-3]
+
+    precio = float(actual["Close"])
+    volumen_promedio = float(actual["VOL_AVG20"])
+    dollar_volume = float(
+        actual["DOLLAR_VOL_AVG20"]
     )
 
-    volumen = float(actual_d["Volume"])
-    volumen_anterior = float(anterior_d["Volume"])
-    volumen_promedio = float(actual_d["VOL_AVG20"])
-    volumen_relativo = float(actual_d["VOL_REL"])
+    # Filtros iniciales
+    if precio < precio_minimo:
+        return None
 
-    high_10 = float(actual_d["HIGH_10"])
-    low_10 = float(actual_d["LOW_10"])
+    if volumen_promedio < volumen_minimo:
+        return None
 
-    atr14 = float(actual_d["ATR14"])
-    atr_pct = float(actual_d["ATR_PCT"])
+    if dollar_volume < dollar_volume_minimo:
+        return None
+
+    ema10 = float(actual["EMA10"])
+    ema20 = float(actual["EMA20"])
+    ema50 = float(actual["EMA50"])
+
+    rsi = float(actual["RSI14"])
+
+    macd = float(actual["MACD"])
+    signal = float(actual["MACD_SIGNAL"])
+    hist = float(actual["MACD_HIST"])
+
+    hist_anterior = float(
+        anterior["MACD_HIST"]
+    )
+
+    hist_anterior_2 = float(
+        anterior_2["MACD_HIST"]
+    )
+
+    volumen_actual = float(actual["Volume"])
+    volumen_anterior = float(anterior["Volume"])
+    volumen_relativo = float(actual["VOL_REL"])
+
+    high_10 = float(actual["HIGH_10"])
+    low_10 = float(actual["LOW_10"])
+
+    atr14 = float(actual["ATR14"])
+    atr_pct = float(actual["ATR_PCT"])
 
     # --------------------------------------------------------
-    # SCORE DE TENDENCIA — 25
+    # TENDENCIA — 25
     # --------------------------------------------------------
 
     score_tendencia = 0
 
-    cond_precio_ema50 = precio > ema50_d
-    cond_ema10_ema20 = ema10_d > ema20_d
-    cond_ema20_ema50 = ema20_d > ema50_d
-
-    if cond_precio_ema50:
+    if precio > ema50:
         score_tendencia += 9
 
-    if cond_ema10_ema20:
+    if ema10 > ema20:
         score_tendencia += 8
 
-    if cond_ema20_ema50:
+    if ema20 > ema50:
         score_tendencia += 8
 
     # --------------------------------------------------------
-    # SCORE MACD — 20
+    # MACD — 20
     # --------------------------------------------------------
 
     score_macd = 0
 
-    cond_macd_signal = macd_d > signal_d
-    cond_hist_positivo = hist_d > 0
-
-    cond_hist_creciente = (
-        hist_d
-        > hist_d_anterior
-        > hist_d_anterior_2
-    )
-
-    if cond_macd_signal:
+    if macd > signal:
         score_macd += 8
 
-    if cond_hist_positivo:
+    if hist > 0:
         score_macd += 8
 
-    if cond_hist_creciente:
+    if hist > hist_anterior > hist_anterior_2:
         score_macd += 4
 
     # --------------------------------------------------------
-    # SCORE RSI — 15
+    # RSI — 15
     # --------------------------------------------------------
 
     score_rsi = 0
 
-    if 55 <= rsi_d <= 68:
+    if 55 <= rsi <= 68:
         score_rsi = 15
 
     elif (
-        50 <= rsi_d < 55
+        50 <= rsi < 55
         or
-        68 < rsi_d <= 75
+        68 < rsi <= 75
     ):
         score_rsi = 8
 
     # --------------------------------------------------------
-    # SCORE VOLUMEN — 15
+    # VOLUMEN — 15
     # --------------------------------------------------------
 
     score_volumen = 0
 
-    cond_volumen_promedio = (
-        volumen > volumen_promedio
-    )
+    if volumen_actual > volumen_promedio:
+        score_volumen += 5
 
-    cond_volumen_15 = (
-        volumen > 1.5 * volumen_promedio
-    )
+    if volumen_actual > 1.5 * volumen_promedio:
+        score_volumen += 5
 
-    cond_vela_volumen = (
-        actual_d["Close"] > actual_d["Open"]
+    if (
+        actual["Close"] > actual["Open"]
         and
-        volumen > volumen_anterior
-    )
-
-    if cond_volumen_promedio:
-        score_volumen += 5
-
-    if cond_volumen_15:
-        score_volumen += 5
-
-    if cond_vela_volumen:
+        volumen_actual > volumen_anterior
+    ):
         score_volumen += 5
 
     # --------------------------------------------------------
-    # SCORE ACCIÓN DEL PRECIO — 10
+    # ACCIÓN DEL PRECIO — 10
     # --------------------------------------------------------
 
     score_precio = 0
 
-    cond_breakout = precio > high_10
+    breakout = precio > high_10
 
     rango_diario = float(
-        actual_d["High"] - actual_d["Low"]
+        actual["High"] - actual["Low"]
     )
 
     if rango_diario > 0:
         posicion_cierre = (
-            float(
-                actual_d["Close"]
-                - actual_d["Low"]
-            )
+            float(actual["Close"] - actual["Low"])
             / rango_diario
         )
     else:
         posicion_cierre = 0
 
-    cond_cierre_superior = (
-        posicion_cierre >= 0.66
-    )
-
-    if cond_breakout:
+    if breakout:
         score_precio += 5
 
-    if cond_cierre_superior:
+    if posicion_cierre >= 0.66:
         score_precio += 5
-
-    # --------------------------------------------------------
-    # CONFIRMACIÓN 4H — 10
-    # --------------------------------------------------------
-
-    precio_4h = float(actual_4h["Close"])
-    ema10_4h = float(actual_4h["EMA10"])
-    ema20_4h = float(actual_4h["EMA20"])
-    hist_4h = float(actual_4h["MACD_HIST"])
-    rsi_4h = float(actual_4h["RSI14"])
-
-    score_4h = 0
-
-    cond_precio_ema20_4h = (
-        precio_4h > ema20_4h
-    )
-
-    cond_ema10_ema20_4h = (
-        ema10_4h > ema20_4h
-    )
-
-    cond_hist_positivo_4h = (
-        hist_4h > 0
-    )
-
-    if cond_precio_ema20_4h:
-        score_4h += 4
-
-    if cond_ema10_ema20_4h:
-        score_4h += 3
-
-    if cond_hist_positivo_4h:
-        score_4h += 3
-
-    # --------------------------------------------------------
-    # CONFIRMACIÓN 1H — 5
-    # --------------------------------------------------------
-
-    precio_1h = float(actual_1h["Close"])
-    ema20_1h = float(actual_1h["EMA20"])
-    rsi_1h = float(actual_1h["RSI14"])
-    hist_1h = float(actual_1h["MACD_HIST"])
-
-    score_1h = 0
-
-    cond_precio_ema20_1h = (
-        precio_1h > ema20_1h
-    )
-
-    cond_rsi_1h = (
-        50 <= rsi_1h <= 70
-    )
-
-    cond_hist_positivo_1h = (
-        hist_1h > 0
-    )
-
-    if cond_precio_ema20_1h:
-        score_1h += 2
-
-    if cond_rsi_1h:
-        score_1h += 2
-
-    if cond_hist_positivo_1h:
-        score_1h += 1
-
-    # --------------------------------------------------------
-    # SCORE TOTAL
-    # --------------------------------------------------------
 
     score_diario = (
         score_tendencia
@@ -603,15 +675,215 @@ def analizar_ticker(ticker):
         + score_precio
     )
 
+    return {
+        "Ticker": ticker,
+        "Empresa": empresa,
+        "Origen": origen,
+        "Score diario": int(score_diario),
+        "Score tendencia": int(score_tendencia),
+        "Score MACD": int(score_macd),
+        "Score RSI": int(score_rsi),
+        "Score volumen": int(score_volumen),
+        "Score precio": int(score_precio),
+        "Precio": precio,
+        "EMA10 D": ema10,
+        "EMA20 D": ema20,
+        "EMA50 D": ema50,
+        "RSI D": rsi,
+        "MACD D": macd,
+        "Signal D": signal,
+        "Hist MACD D": hist,
+        "Vol/Avg20": volumen_relativo,
+        "Volumen promedio": volumen_promedio,
+        "Dollar Volume": dollar_volume,
+        "ATR14": atr14,
+        "ATR %": atr_pct,
+        "High 10D": high_10,
+        "Low 10D": low_10
+    }
+
+
+# ============================================================
+# CONVERTIR 1H A 4H
+# ============================================================
+
+def convertir_1h_a_4h(df_1h):
+    """
+    Construye velas 4H agrupando barras dentro de cada sesión.
+    """
+
+    if df_1h.empty:
+        return pd.DataFrame()
+
+    df = df_1h.copy()
+
+    df.index = pd.to_datetime(
+        df.index,
+        errors="coerce"
+    )
+
+    df = df[
+        ~df.index.isna()
+    ].copy()
+
+    df["SESSION_DATE"] = df.index.date
+
+    df["ORDEN"] = (
+        df.groupby("SESSION_DATE")
+        .cumcount()
+    )
+
+    df["BLOQUE_4H"] = (
+        df["ORDEN"] // 4
+    )
+
+    df_4h = (
+        df.groupby(
+            ["SESSION_DATE", "BLOQUE_4H"]
+        )
+        .agg({
+            "Open": "first",
+            "High": "max",
+            "Low": "min",
+            "Close": "last",
+            "Volume": "sum"
+        })
+    )
+
+    df_4h = df_4h.reset_index(
+        drop=True
+    )
+
+    return df_4h
+
+
+# ============================================================
+# DESCARGA INTRADÍA
+# ============================================================
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def descargar_intradia(ticker):
+    """
+    Descarga 60 días de velas 1H.
+    """
+
+    df = yf.download(
+        ticker,
+        period="60d",
+        interval="1h",
+        auto_adjust=True,
+        prepost=False,
+        progress=False,
+        threads=False,
+        timeout=30
+    )
+
+    if df.empty:
+        return pd.DataFrame()
+
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = df.columns.get_level_values(0)
+
+    return limpiar_columnas_yfinance(df)
+
+
+# ============================================================
+# CONFIRMACIONES INTRADÍA
+# ============================================================
+
+def agregar_confirmacion_intradia(fila):
+    """
+    Agrega score 4H, score 1H, entrada, stop y objetivos.
+    """
+
+    ticker = fila["Ticker"]
+
+    df_1h = descargar_intradia(ticker)
+
+    if df_1h.empty:
+        fila["Score 4H"] = 0
+        fila["Score 1H"] = 0
+        fila["Score total"] = fila["Score diario"]
+        fila["Estado intradía"] = "Sin datos"
+        return fila
+
+    df_4h = convertir_1h_a_4h(
+        df_1h
+    )
+
+    df_1h = calcular_indicadores(
+        df_1h
+    ).dropna()
+
+    df_4h = calcular_indicadores(
+        df_4h
+    ).dropna()
+
+    if len(df_1h) < 50 or len(df_4h) < 50:
+        fila["Score 4H"] = 0
+        fila["Score 1H"] = 0
+        fila["Score total"] = fila["Score diario"]
+        fila["Estado intradía"] = "Datos insuficientes"
+        return fila
+
+    actual_1h = df_1h.iloc[-1]
+    actual_4h = df_4h.iloc[-1]
+
+    # --------------------------------------------------------
+    # SCORE 4H — 10
+    # --------------------------------------------------------
+
+    score_4h = 0
+
+    precio_4h = float(actual_4h["Close"])
+    ema10_4h = float(actual_4h["EMA10"])
+    ema20_4h = float(actual_4h["EMA20"])
+    rsi_4h = float(actual_4h["RSI14"])
+    hist_4h = float(actual_4h["MACD_HIST"])
+
+    if precio_4h > ema20_4h:
+        score_4h += 4
+
+    if ema10_4h > ema20_4h:
+        score_4h += 3
+
+    if hist_4h > 0:
+        score_4h += 3
+
+    # --------------------------------------------------------
+    # SCORE 1H — 5
+    # --------------------------------------------------------
+
+    score_1h = 0
+
+    precio_1h = float(actual_1h["Close"])
+    ema20_1h = float(actual_1h["EMA20"])
+    rsi_1h = float(actual_1h["RSI14"])
+    hist_1h = float(actual_1h["MACD_HIST"])
+
+    if precio_1h > ema20_1h:
+        score_1h += 2
+
+    if 50 <= rsi_1h <= 70:
+        score_1h += 2
+
+    if hist_1h > 0:
+        score_1h += 1
+
     score_total = (
-        score_diario
+        int(fila["Score diario"])
         + score_4h
         + score_1h
     )
 
     # --------------------------------------------------------
-    # ENTRADA, STOP LOSS Y OBJETIVOS
+    # ENTRADA Y STOP
     # --------------------------------------------------------
+
+    precio = float(fila["Precio"])
+    high_10 = float(fila["High 10D"])
+    low_10 = float(fila["Low 10D"])
+    atr14 = float(fila["ATR14"])
 
     entrada = max(
         precio,
@@ -626,7 +898,7 @@ def analizar_ticker(ticker):
         entrada * 0.95
     )
 
-    stops_validos = [
+    candidatos_stop = [
         stop_atr,
         stop_5pct
     ]
@@ -636,9 +908,13 @@ def analizar_ticker(ticker):
         and
         low_10 >= entrada * 0.90
     ):
-        stops_validos.append(low_10)
+        candidatos_stop.append(
+            low_10
+        )
 
-    stop_loss = max(stops_validos)
+    stop_loss = max(
+        candidatos_stop
+    )
 
     riesgo_unitario = (
         entrada - stop_loss
@@ -649,20 +925,20 @@ def analizar_ticker(ticker):
             riesgo_unitario / entrada
         ) * 100
 
-        objetivo_2r = (
+        tp_2r = (
             entrada
             + 2 * riesgo_unitario
         )
 
-        objetivo_3r = (
+        tp_3r = (
             entrada
             + 3 * riesgo_unitario
         )
 
     else:
         riesgo_pct = np.nan
-        objetivo_2r = np.nan
-        objetivo_3r = np.nan
+        tp_2r = np.nan
+        tp_3r = np.nan
 
     # --------------------------------------------------------
     # DECISIÓN
@@ -692,235 +968,456 @@ def analizar_ticker(ticker):
     else:
         decision = "NO COMPRAR"
 
-    # --------------------------------------------------------
-    # NOTAS
-    # --------------------------------------------------------
+    fila["Score 4H"] = score_4h
+    fila["Score 1H"] = score_1h
+    fila["Score total"] = score_total
+    fila["Decisión"] = decision
 
-    notas = []
+    fila["Entrada"] = round(
+        entrada,
+        2
+    )
 
-    if not cond_precio_ema50:
-        notas.append("Precio bajo EMA50")
+    fila["Stop loss"] = round(
+        stop_loss,
+        2
+    )
 
-    if not cond_ema10_ema20:
-        notas.append("EMA10 bajo EMA20")
+    fila["Riesgo %"] = round(
+        riesgo_pct,
+        2
+    )
 
-    if not cond_macd_signal:
-        notas.append("MACD bajo Signal")
+    fila["TP 2R"] = round(
+        tp_2r,
+        2
+    )
 
-    if not cond_hist_positivo:
-        notas.append("Histograma diario negativo")
+    fila["TP 3R"] = round(
+        tp_3r,
+        2
+    )
 
-    if volumen_relativo < 1:
-        notas.append("Volumen bajo")
+    fila["EMA10 4H"] = round(
+        ema10_4h,
+        2
+    )
 
-    if not cond_breakout:
-        notas.append("Sin breakout 10D")
+    fila["EMA20 4H"] = round(
+        ema20_4h,
+        2
+    )
 
-    if score_4h < 7:
-        notas.append("Confirmación 4H débil")
+    fila["RSI 4H"] = round(
+        rsi_4h,
+        2
+    )
 
-    if score_1h < 3:
-        notas.append("Confirmación 1H débil")
+    fila["Hist MACD 4H"] = round(
+        hist_4h,
+        4
+    )
 
-    if not notas:
-        texto_notas = "Setup completo"
+    fila["EMA20 1H"] = round(
+        ema20_1h,
+        2
+    )
 
-    else:
-        texto_notas = "; ".join(
-            notas[:4]
-        )
+    fila["RSI 1H"] = round(
+        rsi_1h,
+        2
+    )
 
-    return {
-        "Ticker": ticker,
-        "Decisión": decision,
-        "Score total": int(score_total),
-        "Score diario": int(score_diario),
-        "Score 4H": int(score_4h),
-        "Score 1H": int(score_1h),
-        "Precio": round(precio, 2),
-        "Entrada": round(entrada, 2),
-        "Stop loss": round(stop_loss, 2),
-        "Riesgo %": round(riesgo_pct, 2),
-        "TP 2R": round(objetivo_2r, 2),
-        "TP 3R": round(objetivo_3r, 2),
-        "EMA10 D": round(ema10_d, 2),
-        "EMA20 D": round(ema20_d, 2),
-        "EMA50 D": round(ema50_d, 2),
-        "RSI D": round(rsi_d, 2),
-        "MACD D": round(macd_d, 4),
-        "Signal D": round(signal_d, 4),
-        "Hist MACD D": round(hist_d, 4),
-        "Vol/Avg20": round(volumen_relativo, 2),
-        "ATR14": round(atr14, 2),
-        "ATR %": round(atr_pct, 2),
-        "RSI 4H": round(rsi_4h, 2),
-        "Hist MACD 4H": round(hist_4h, 4),
-        "RSI 1H": round(rsi_1h, 2),
-        "Hist MACD 1H": round(hist_1h, 4),
-        "Notas": texto_notas
-    }
+    fila["Hist MACD 1H"] = round(
+        hist_1h,
+        4
+    )
+
+    fila["Estado intradía"] = "Completo"
+
+    return fila
 
 
 # ============================================================
-# INTERFAZ DEL SCANNER
+# INTERFAZ LATERAL
 # ============================================================
 
 with st.sidebar:
 
     st.header("Configuración")
 
-    tickers_texto = st.text_area(
-        "Tickers separados por coma",
-        value=", ".join(TICKERS_PREDETERMINADOS),
-        height=180
-    )
-
-    score_minimo = st.slider(
-        "Score mínimo para candidatos",
-        min_value=0,
-        max_value=100,
-        value=70
-    )
-
-    mostrar_no_compra = st.checkbox(
-        "Mostrar acciones con score bajo",
-        value=True
-    )
-
-    pausa_llamadas = st.number_input(
-        "Pausa entre tickers",
+    precio_minimo = st.number_input(
+        "Precio mínimo",
         min_value=0.0,
-        max_value=5.0,
-        value=0.3,
-        step=0.1,
-        help="Ayuda a evitar bloqueos temporales de Yahoo Finance."
+        value=5.0,
+        step=1.0
+    )
+
+    volumen_minimo = st.number_input(
+        "Volumen promedio mínimo 20D",
+        min_value=0,
+        value=500000,
+        step=100000
+    )
+
+    dollar_volume_minimo = st.number_input(
+        "Valor negociado promedio mínimo",
+        min_value=0,
+        value=10000000,
+        step=1000000
+    )
+
+    score_diario_minimo = st.slider(
+        "Score diario mínimo para análisis intradía",
+        min_value=0,
+        max_value=85,
+        value=55
+    )
+
+    top_intradia = st.slider(
+        "Número máximo para confirmación intradía",
+        min_value=10,
+        max_value=100,
+        value=40,
+        step=5
+    )
+
+    tamano_lote = st.selectbox(
+        "Tickers por lote",
+        options=[25, 50, 75, 100],
+        index=2
+    )
+
+    pausa_lotes = st.number_input(
+        "Pausa entre lotes",
+        min_value=0.0,
+        max_value=10.0,
+        value=1.0,
+        step=0.5
     )
 
     ejecutar = st.button(
-        "🔍 Ejecutar scanner",
+        "🔍 Escanear Nasdaq + S&P 500",
         type="primary",
         use_container_width=True
     )
 
 
 # ============================================================
-# FILA DE CONDICIONES IDEALES
+# INFORMACIÓN INICIAL
 # ============================================================
 
-fila_ideal = {
-    "Rank": "IDEAL",
-    "Ticker": "—",
-    "Decisión": "COMPRAR",
-    "Score total": "90+",
-    "Score diario": "80+",
-    "Score 4H": "8–10",
-    "Score 1H": "4–5",
-    "Precio": "—",
-    "Entrada": "Breakout 10D",
-    "Stop loss": "2 ATR / swing",
-    "Riesgo %": "3–5%",
-    "TP 2R": "2× riesgo",
-    "TP 3R": "3× riesgo",
-    "EMA10 D": "> EMA20",
-    "EMA20 D": "> EMA50",
-    "EMA50 D": "Precio > EMA50",
-    "RSI D": "55–68",
-    "MACD D": "> Signal",
-    "Signal D": "< MACD",
-    "Hist MACD D": ">0 creciente",
-    "Vol/Avg20": ">1.5x",
-    "ATR14": "—",
-    "ATR %": "2–5%",
-    "RSI 4H": "50–70",
-    "Hist MACD 4H": ">0",
-    "RSI 1H": "50–70",
-    "Hist MACD 1H": ">0",
-    "Notas": "Condiciones ideales"
-}
+if not ejecutar:
+
+    try:
+        universo_preview = obtener_universo()
+
+        st.info(
+            f"Universo disponible: "
+            f"{len(universo_preview):,} símbolos únicos."
+        )
+
+        resumen_origen = (
+            universo_preview["Origen"]
+            .value_counts()
+            .reset_index()
+        )
+
+        resumen_origen.columns = [
+            "Origen",
+            "Símbolos"
+        ]
+
+        st.dataframe(
+            resumen_origen,
+            use_container_width=True,
+            hide_index=True
+        )
+
+    except Exception as error:
+        st.warning(
+            f"No fue posible cargar la lista: {error}"
+        )
+
+    st.subheader("Flujo del scanner")
+
+    st.code(
+        """
+Nasdaq + S&P 500
+        ↓
+Filtro de precio y liquidez
+        ↓
+Indicadores diarios
+        ↓
+Score diario /85
+        ↓
+Mejores candidatos
+        ↓
+Confirmación 4H y 1H
+        ↓
+Score total /100
+        ↓
+Entrada, stop, TP 2R y TP 3R
+        """
+    )
 
 
 # ============================================================
-# EJECUCIÓN
+# EJECUCIÓN DEL SCANNER
 # ============================================================
 
 if ejecutar:
 
-    tickers = [
-        ticker.strip().upper()
-        for ticker in tickers_texto.split(",")
-        if ticker.strip()
-    ]
+    tiempo_inicio = time.time()
 
-    tickers = list(dict.fromkeys(tickers))
+    with st.spinner(
+        "Cargando universo Nasdaq + S&P 500..."
+    ):
+        universo = obtener_universo()
 
-    if not tickers:
-        st.warning(
-            "Agrega al menos un ticker."
+    st.success(
+        f"Universo cargado: "
+        f"{len(universo):,} símbolos únicos."
+    )
+
+    mapa_empresas = universo.set_index(
+        "Ticker"
+    ).to_dict("index")
+
+    tickers = universo["Ticker"].tolist()
+
+    lotes = list(
+        dividir_lista(
+            tickers,
+            tamano_lote
         )
-        st.stop()
+    )
 
-    resultados = []
+    resultados_diarios = []
     errores = []
 
-    barra = st.progress(0)
-    mensaje = st.empty()
+    barra_diaria = st.progress(0)
+    mensaje_diario = st.empty()
 
-    total_tickers = len(tickers)
+    for numero_lote, lote in enumerate(lotes):
 
-    for indice, ticker in enumerate(tickers):
-
-        mensaje.write(
-            f"Analizando {ticker} "
-            f"({indice + 1}/{total_tickers})..."
+        mensaje_diario.write(
+            f"Descargando lote "
+            f"{numero_lote + 1}/{len(lotes)} "
+            f"— {len(lote)} símbolos..."
         )
 
         try:
-            resultado = analizar_ticker(ticker)
-
-            resultados.append(resultado)
-
-        except Exception as error:
-            errores.append(
-                {
-                    "Ticker": ticker,
-                    "Error": str(error)
-                }
+            datos_lote = descargar_lote_diario(
+                tuple(lote)
             )
 
-        barra.progress(
-            (indice + 1) / total_tickers
+            for ticker in lote:
+
+                df_ticker = extraer_ticker_del_lote(
+                    datos_lote,
+                    ticker,
+                    len(lote)
+                )
+
+                if df_ticker.empty:
+                    continue
+
+                metadata = mapa_empresas.get(
+                    ticker,
+                    {}
+                )
+
+                resultado = analizar_diario(
+                    ticker=ticker,
+                    empresa=metadata.get(
+                        "Empresa",
+                        ""
+                    ),
+                    origen=metadata.get(
+                        "Origen",
+                        ""
+                    ),
+                    df=df_ticker,
+                    precio_minimo=precio_minimo,
+                    volumen_minimo=volumen_minimo,
+                    dollar_volume_minimo=dollar_volume_minimo
+                )
+
+                if resultado is not None:
+                    resultados_diarios.append(
+                        resultado
+                    )
+
+        except Exception as error:
+            errores.append({
+                "Lote": numero_lote + 1,
+                "Error": str(error)
+            })
+
+        barra_diaria.progress(
+            (numero_lote + 1)
+            / len(lotes)
         )
 
-        if pausa_llamadas > 0:
-            time.sleep(pausa_llamadas)
+        if pausa_lotes > 0:
+            time.sleep(
+                pausa_lotes
+            )
 
-    mensaje.success(
-        "Scanner terminado."
+    mensaje_diario.success(
+        "Análisis diario terminado."
     )
 
-    if not resultados:
+    if not resultados_diarios:
         st.error(
-            "No fue posible analizar ningún ticker."
+            "Ninguna acción superó los filtros "
+            "o Yahoo Finance bloqueó las descargas."
         )
 
         if errores:
             st.dataframe(
-                pd.DataFrame(errores),
-                use_container_width=True
+                pd.DataFrame(errores)
             )
 
         st.stop()
 
-    df_resultados = pd.DataFrame(
-        resultados
+    df_diario = pd.DataFrame(
+        resultados_diarios
     )
 
-    df_resultados = df_resultados.sort_values(
+    df_diario = df_diario.sort_values(
+        by=[
+            "Score diario",
+            "Vol/Avg20",
+            "Dollar Volume"
+        ],
+        ascending=[
+            False,
+            False,
+            False
+        ]
+    ).reset_index(drop=True)
+
+    candidatos_intradia = df_diario[
+        df_diario["Score diario"]
+        >= score_diario_minimo
+    ].head(
+        top_intradia
+    ).copy()
+
+    st.subheader(
+        "Resultado del prefiltro diario"
+    )
+
+    r1, r2, r3, r4 = st.columns(4)
+
+    with r1:
+        st.metric(
+            "Universo",
+            f"{len(universo):,}"
+        )
+
+    with r2:
+        st.metric(
+            "Superaron liquidez",
+            f"{len(df_diario):,}"
+        )
+
+    with r3:
+        st.metric(
+            "Para intradía",
+            len(candidatos_intradia)
+        )
+
+    with r4:
+        mejor_diario = int(
+            df_diario["Score diario"].max()
+        )
+
+        st.metric(
+            "Mejor score diario",
+            f"{mejor_diario}/85"
+        )
+
+    # --------------------------------------------------------
+    # CONFIRMACIÓN INTRADÍA
+    # --------------------------------------------------------
+
+    resultados_finales = []
+
+    barra_intradia = st.progress(0)
+    mensaje_intradia = st.empty()
+
+    total_intradia = len(
+        candidatos_intradia
+    )
+
+    for indice, (_, fila) in enumerate(
+        candidatos_intradia.iterrows()
+    ):
+
+        ticker = fila["Ticker"]
+
+        mensaje_intradia.write(
+            f"Confirmación intradía "
+            f"{ticker} "
+            f"({indice + 1}/{total_intradia})..."
+        )
+
+        try:
+            resultado_final = (
+                agregar_confirmacion_intradia(
+                    fila.to_dict()
+                )
+            )
+
+            resultados_finales.append(
+                resultado_final
+            )
+
+        except Exception as error:
+            fila_error = fila.to_dict()
+
+            fila_error["Score 4H"] = 0
+            fila_error["Score 1H"] = 0
+            fila_error["Score total"] = (
+                fila_error["Score diario"]
+            )
+
+            fila_error["Decisión"] = (
+                "ERROR INTRADÍA"
+            )
+
+            fila_error["Estado intradía"] = str(
+                error
+            )
+
+            resultados_finales.append(
+                fila_error
+            )
+
+        barra_intradia.progress(
+            (indice + 1)
+            / max(total_intradia, 1)
+        )
+
+        time.sleep(0.25)
+
+    mensaje_intradia.success(
+        "Confirmación intradía terminada."
+    )
+
+    df_final = pd.DataFrame(
+        resultados_finales
+    )
+
+    df_final = df_final.sort_values(
         by=[
             "Score total",
+            "Score diario",
             "Score 4H",
-            "Score 1H",
-            "Vol/Avg20"
+            "Score 1H"
         ],
         ascending=[
             False,
@@ -930,146 +1427,176 @@ if ejecutar:
         ]
     ).reset_index(drop=True)
 
-    df_resultados.insert(
+    df_final.insert(
         0,
         "Rank",
-        range(1, len(df_resultados) + 1)
+        range(1, len(df_final) + 1)
     )
 
-    if not mostrar_no_compra:
-        df_resultados = df_resultados[
-            df_resultados["Score total"]
-            >= score_minimo
-        ].copy()
+    # --------------------------------------------------------
+    # FILA IDEAL
+    # --------------------------------------------------------
 
-    candidatos = df_resultados[
-        df_resultados["Score total"]
-        >= score_minimo
+    fila_ideal = {
+        "Rank": "IDEAL",
+        "Ticker": "—",
+        "Empresa": "Condiciones ideales",
+        "Origen": "Nasdaq / S&P 500",
+        "Decisión": "COMPRAR",
+        "Score total": "90+",
+        "Score diario": "80–85",
+        "Score 4H": "8–10",
+        "Score 1H": "4–5",
+        "Precio": "≥ $5",
+        "Entrada": "Breakout 10D",
+        "Stop loss": "2 ATR / swing",
+        "Riesgo %": "3–5%",
+        "TP 2R": "2× riesgo",
+        "TP 3R": "3× riesgo",
+        "EMA10 D": "> EMA20",
+        "EMA20 D": "> EMA50",
+        "EMA50 D": "Precio > EMA50",
+        "RSI D": "55–68",
+        "MACD D": "> Signal",
+        "Signal D": "< MACD",
+        "Hist MACD D": ">0 creciente",
+        "Vol/Avg20": ">1.5x",
+        "ATR %": "2–5%",
+        "RSI 4H": "50–70",
+        "Hist MACD 4H": ">0",
+        "RSI 1H": "50–70",
+        "Hist MACD 1H": ">0"
+    }
+
+    # --------------------------------------------------------
+    # TABLA PRINCIPAL
+    # --------------------------------------------------------
+
+    st.subheader(
+        "🏆 Ranking final"
+    )
+
+    columnas_principales = [
+        "Rank",
+        "Ticker",
+        "Empresa",
+        "Origen",
+        "Decisión",
+        "Score total",
+        "Score diario",
+        "Score 4H",
+        "Score 1H",
+        "Precio",
+        "Entrada",
+        "Stop loss",
+        "Riesgo %",
+        "TP 2R",
+        "TP 3R",
+        "EMA10 D",
+        "EMA20 D",
+        "EMA50 D",
+        "RSI D",
+        "MACD D",
+        "Signal D",
+        "Hist MACD D",
+        "Vol/Avg20",
+        "ATR %",
+        "RSI 4H",
+        "Hist MACD 4H",
+        "RSI 1H",
+        "Hist MACD 1H",
+        "Estado intradía"
+    ]
+
+    columnas_disponibles = [
+        columna
+        for columna in columnas_principales
+        if columna in df_final.columns
+    ]
+
+    tabla_final = df_final[
+        columnas_disponibles
     ].copy()
 
-    # --------------------------------------------------------
-    # MÉTRICAS GENERALES
-    # --------------------------------------------------------
-
-    st.subheader(
-        "Resumen del scanner"
-    )
-
-    m1, m2, m3, m4 = st.columns(4)
-
-    with m1:
-        st.metric(
-            "Acciones analizadas",
-            len(resultados)
-        )
-
-    with m2:
-        st.metric(
-            "Candidatos",
-            len(candidatos)
-        )
-
-    with m3:
-        compras = df_resultados[
-            df_resultados["Decisión"].isin(
-                [
-                    "COMPRA AGRESIVA",
-                    "COMPRAR"
-                ]
-            )
-        ]
-
-        st.metric(
-            "Señales de compra",
-            len(compras)
-        )
-
-    with m4:
-        mejor_score = (
-            int(df_resultados["Score total"].max())
-            if not df_resultados.empty
-            else 0
-        )
-
-        st.metric(
-            "Mejor score",
-            f"{mejor_score}/100"
-        )
-
-    # --------------------------------------------------------
-    # TABLA DE CANDIDATOS
-    # --------------------------------------------------------
-
-    st.subheader(
-        "✅ Candidatos por score"
-    )
-
-    if candidatos.empty:
-        st.warning(
-            "No hay acciones que superen "
-            "el score mínimo seleccionado."
-        )
-
-    else:
-        tabla_candidatos = pd.concat(
-            [
-                pd.DataFrame([fila_ideal]),
-                candidatos
-            ],
-            ignore_index=True
-        )
-
-        st.dataframe(
-            tabla_candidatos,
-            use_container_width=True,
-            hide_index=True
-        )
-
-    # --------------------------------------------------------
-    # TABLA COMPLETA
-    # --------------------------------------------------------
-
-    st.subheader(
-        "📋 Ranking completo"
-    )
-
-    tabla_completa = pd.concat(
+    tabla_con_ideal = pd.concat(
         [
             pd.DataFrame([fila_ideal]),
-            df_resultados
+            tabla_final
         ],
         ignore_index=True
     )
 
     st.dataframe(
-        tabla_completa,
+        tabla_con_ideal,
         use_container_width=True,
-        hide_index=True
+        hide_index=True,
+        height=650
     )
 
     # --------------------------------------------------------
-    # DESCARGA CSV
+    # SEÑALES DE COMPRA
     # --------------------------------------------------------
 
-    csv = df_resultados.to_csv(
+    compras = df_final[
+        df_final["Decisión"].isin([
+            "COMPRA AGRESIVA",
+            "COMPRAR"
+        ])
+    ].copy()
+
+    st.subheader(
+        "✅ Señales de compra"
+    )
+
+    if compras.empty:
+        st.warning(
+            "No se encontraron señales de compra "
+            "con confirmación suficiente."
+        )
+
+    else:
+        st.dataframe(
+            compras[
+                [
+                    columna
+                    for columna in columnas_principales
+                    if columna in compras.columns
+                ]
+            ],
+            use_container_width=True,
+            hide_index=True
+        )
+
+    # --------------------------------------------------------
+    # DESCARGAS
+    # --------------------------------------------------------
+
+    csv_final = df_final.to_csv(
         index=False
     ).encode("utf-8")
 
     st.download_button(
-        label="⬇️ Descargar resultados CSV",
-        data=csv,
-        file_name="swing_scanner_resultados.csv",
+        "⬇️ Descargar ranking final CSV",
+        data=csv_final,
+        file_name=(
+            "nasdaq_sp500_swing_scanner_"
+            f"{datetime.now().strftime('%Y%m%d_%H%M')}.csv"
+        ),
         mime="text/csv"
     )
 
-    # --------------------------------------------------------
-    # ERRORES
-    # --------------------------------------------------------
+    with st.expander(
+        "Ver ranking diario completo"
+    ):
+        st.dataframe(
+            df_diario,
+            use_container_width=True,
+            hide_index=True
+        )
 
     if errores:
-
         with st.expander(
-            "Ver tickers con errores"
+            "Ver errores de descarga"
         ):
             st.dataframe(
                 pd.DataFrame(errores),
@@ -1077,49 +1604,13 @@ if ejecutar:
                 hide_index=True
             )
 
-
-# ============================================================
-# INFORMACIÓN DE LA ESTRATEGIA
-# ============================================================
-
-else:
-
-    st.info(
-        "Configura la lista de tickers y presiona "
-        "“Ejecutar scanner”."
+    tiempo_total = (
+        time.time() - tiempo_inicio
     )
 
-    st.subheader(
-        "Sistema de puntuación"
-    )
-
-    tabla_pesos = pd.DataFrame(
-        {
-            "Módulo": [
-                "Tendencia diaria",
-                "MACD diario",
-                "RSI diario",
-                "Volumen diario",
-                "Acción del precio",
-                "Confirmación 4H",
-                "Confirmación 1H"
-            ],
-            "Puntos": [
-                PESO_TENDENCIA,
-                PESO_MACD,
-                PESO_RSI,
-                PESO_VOLUMEN,
-                PESO_PRECIO,
-                PESO_4H,
-                PESO_1H
-            ]
-        }
-    )
-
-    st.dataframe(
-        tabla_pesos,
-        use_container_width=True,
-        hide_index=True
+    st.success(
+        f"Scanner completado en "
+        f"{tiempo_total / 60:.1f} minutos."
     )
 
 
@@ -1131,8 +1622,8 @@ st.divider()
 
 st.caption(
     "Herramienta educativa de análisis técnico. "
-    "Los datos de Yahoo Finance pueden tener retraso. "
-    "Una puntuación alta no garantiza beneficios. "
-    "Revisa noticias, resultados trimestrales, liquidez "
+    "Yahoo Finance puede retrasar, limitar o interrumpir "
+    "descargas masivas. Una puntuación alta no garantiza "
+    "beneficios. Revisa noticias, earnings, liquidez, spreads "
     "y riesgo antes de ejecutar una operación."
 )
