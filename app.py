@@ -1,3 +1,5 @@
+import time
+
 import numpy as np
 import pandas as pd
 import streamlit as st
@@ -5,55 +7,137 @@ import yfinance as yf
 
 
 # ============================================================
-# CONFIGURACIÓN
+# CONFIGURACIÓN GENERAL
 # ============================================================
 
 st.set_page_config(
     page_title="Swing Trading Scanner",
+    page_icon="📈",
     layout="wide"
 )
 
 st.title("📈 Swing Trading Scanner")
 st.caption(
-    "Estrategia de 3 a 10 días con análisis diario "
+    "Scanner para operaciones de 3 a 10 días con análisis diario "
     "y confirmaciones intradía de 4H y 1H."
 )
 
 
 # ============================================================
-# FUNCIONES AUXILIARES
+# CONFIGURACIÓN DE LA ESTRATEGIA
+# ============================================================
+
+PESO_TENDENCIA = 25
+PESO_MACD = 20
+PESO_RSI = 15
+PESO_VOLUMEN = 15
+PESO_PRECIO = 10
+PESO_4H = 10
+PESO_1H = 5
+
+TICKERS_PREDETERMINADOS = [
+    "AAPL",
+    "MSFT",
+    "NVDA",
+    "AMD",
+    "META",
+    "AMZN",
+    "GOOGL",
+    "TSLA",
+    "NFLX",
+    "AVGO",
+    "PLTR",
+    "COIN",
+    "CRM",
+    "ORCL",
+    "QCOM",
+    "MU"
+]
+
+
+# ============================================================
+# FUNCIONES DE DATOS
 # ============================================================
 
 def limpiar_columnas_yfinance(df):
     """
-    Corrige las columnas MultiIndex que yfinance puede devolver.
+    Corrige las columnas MultiIndex que puede devolver yfinance.
     """
+
+    if df is None or df.empty:
+        return pd.DataFrame()
+
+    df = df.copy()
+
     if isinstance(df.columns, pd.MultiIndex):
         df.columns = df.columns.get_level_values(0)
 
-    return df.copy()
+    return df
 
+
+@st.cache_data(ttl=900, show_spinner=False)
+def descargar_datos(ticker):
+    """
+    Descarga datos diarios y datos de una hora.
+    El caché dura 15 minutos.
+    """
+
+    diario = yf.download(
+        ticker,
+        period="1y",
+        interval="1d",
+        auto_adjust=True,
+        progress=False,
+        threads=False
+    )
+
+    una_hora = yf.download(
+        ticker,
+        period="60d",
+        interval="1h",
+        auto_adjust=True,
+        prepost=False,
+        progress=False,
+        threads=False
+    )
+
+    diario = limpiar_columnas_yfinance(diario)
+    una_hora = limpiar_columnas_yfinance(una_hora)
+
+    if not diario.empty:
+        diario = diario.reset_index()
+
+    if not una_hora.empty:
+        una_hora = una_hora.reset_index()
+
+    return diario, una_hora
+
+
+# ============================================================
+# FUNCIONES DE INDICADORES
+# ============================================================
 
 def calcular_rsi(close, periodo=14):
     """
-    Calcula RSI utilizando medias exponenciales tipo Wilder.
+    Calcula RSI utilizando suavizado exponencial tipo Wilder.
     """
+
     delta = close.diff()
 
     ganancias = delta.clip(lower=0)
     perdidas = -delta.clip(upper=0)
 
-    media_ganancias = ganancias.ewm(
+    promedio_ganancias = ganancias.ewm(
         alpha=1 / periodo,
         adjust=False
     ).mean()
 
-    media_perdidas = perdidas.ewm(
+    promedio_perdidas = perdidas.ewm(
         alpha=1 / periodo,
         adjust=False
     ).mean()
 
-    rs = media_ganancias / media_perdidas.replace(0, np.nan)
+    rs = promedio_ganancias / promedio_perdidas.replace(0, np.nan)
 
     rsi = 100 - (100 / (1 + rs))
 
@@ -62,10 +146,27 @@ def calcular_rsi(close, periodo=14):
 
 def calcular_indicadores(df):
     """
-    Calcula EMAs, RSI, MACD, volumen relativo, ATR
-    y niveles de máximos y mínimos recientes.
+    Calcula todos los indicadores utilizados por la estrategia.
     """
+
+    if df.empty:
+        return pd.DataFrame()
+
     df = df.copy()
+
+    columnas_requeridas = [
+        "Open",
+        "High",
+        "Low",
+        "Close",
+        "Volume"
+    ]
+
+    for columna in columnas_requeridas:
+        df[columna] = pd.to_numeric(
+            df[columna],
+            errors="coerce"
+        )
 
     # EMAs
     df["EMA10"] = df["Close"].ewm(
@@ -112,56 +213,48 @@ def calcular_indicadores(df):
     )
 
     # Volumen relativo
-    df["VOL_AVG20"] = (
-        df["Volume"]
-        .rolling(20)
-        .mean()
-    )
+    df["VOL_AVG20"] = df["Volume"].rolling(20).mean()
 
     df["VOL_REL"] = (
         df["Volume"] / df["VOL_AVG20"]
     )
 
-    # Máximos y mínimos anteriores
-    df["HIGH_10D"] = (
+    # Máximos y mínimos previos de 10 velas
+    df["HIGH_10"] = (
         df["High"]
         .rolling(10)
         .max()
         .shift(1)
     )
 
-    df["LOW_10D"] = (
+    df["LOW_10"] = (
         df["Low"]
         .rolling(10)
         .min()
         .shift(1)
     )
 
-    # ATR14
-    high_low = df["High"] - df["Low"]
+    # True Range y ATR14
+    rango_max_min = df["High"] - df["Low"]
 
-    high_close_prev = (
+    max_cierre_anterior = (
         df["High"] - df["Close"].shift(1)
     ).abs()
 
-    low_close_prev = (
+    min_cierre_anterior = (
         df["Low"] - df["Close"].shift(1)
     ).abs()
 
     df["TRUE_RANGE"] = pd.concat(
         [
-            high_low,
-            high_close_prev,
-            low_close_prev
+            rango_max_min,
+            max_cierre_anterior,
+            min_cierre_anterior
         ],
         axis=1
     ).max(axis=1)
 
-    df["ATR14"] = (
-        df["TRUE_RANGE"]
-        .rolling(14)
-        .mean()
-    )
+    df["ATR14"] = df["TRUE_RANGE"].rolling(14).mean()
 
     df["ATR_PCT"] = (
         df["ATR14"] / df["Close"]
@@ -172,955 +265,861 @@ def calcular_indicadores(df):
 
 def convertir_1h_a_4h(df_1h):
     """
-    Agrupa velas de una hora en velas aproximadas de cuatro horas.
-
-    Cada sesión bursátil se divide en:
-    - Primer bloque: primeras cuatro velas de 1H.
-    - Segundo bloque: velas restantes de la sesión.
+    Agrupa las velas de una hora en bloques de aproximadamente
+    cuatro horas dentro de cada sesión bursátil.
     """
+
+    if df_1h.empty:
+        return pd.DataFrame()
+
     df = df_1h.copy()
 
     if "Datetime" in df.columns:
         columna_fecha = "Datetime"
+
     elif "Date" in df.columns:
         columna_fecha = "Date"
+
     else:
-        raise ValueError(
-            "No se encontró columna Date o Datetime."
-        )
+        return pd.DataFrame()
 
     df[columna_fecha] = pd.to_datetime(
-        df[columna_fecha]
+        df[columna_fecha],
+        errors="coerce"
     )
 
-    df["SESSION_DATE"] = (
-        df[columna_fecha]
-        .dt.date
+    df = df.dropna(
+        subset=[columna_fecha]
+    )
+
+    df["SESSION_DATE"] = df[columna_fecha].dt.date
+
+    df["ORDEN_SESION"] = (
+        df.groupby("SESSION_DATE")
+        .cumcount()
     )
 
     df["BLOQUE_4H"] = (
-        df.groupby("SESSION_DATE")
-        .cumcount() // 4
+        df["ORDEN_SESION"] // 4
     )
 
     df_4h = (
         df.groupby(
-            ["SESSION_DATE", "BLOQUE_4H"],
+            [
+                "SESSION_DATE",
+                "BLOQUE_4H"
+            ],
             as_index=False
         )
         .agg(
-            {
-                columna_fecha: "first",
-                "Open": "first",
-                "High": "max",
-                "Low": "min",
-                "Close": "last",
-                "Volume": "sum"
-            }
+            Datetime=(columna_fecha, "first"),
+            Open=("Open", "first"),
+            High=("High", "max"),
+            Low=("Low", "min"),
+            Close=("Close", "last"),
+            Volume=("Volume", "sum")
         )
-    )
-
-    df_4h = df_4h.rename(
-        columns={columna_fecha: "Datetime"}
     )
 
     return df_4h
 
 
 # ============================================================
-# DESCARGA DE DATOS
+# FUNCIONES DE PUNTUACIÓN
 # ============================================================
 
-ticker = st.text_input(
-    "Ticker",
-    value="AAPL"
-).upper().strip()
+def analizar_ticker(ticker):
+    """
+    Analiza un ticker y devuelve una fila con sus resultados.
+    """
 
-if not ticker:
-    st.warning("Escribe un ticker.")
-    st.stop()
+    df_diario, df_1h = descargar_datos(ticker)
 
-with st.spinner(
-    f"Descargando datos de {ticker}..."
-):
-    df_diario = yf.download(
-        ticker,
-        period="1y",
-        interval="1d",
-        auto_adjust=True,
-        progress=False
+    if df_diario.empty:
+        raise ValueError("Sin datos diarios")
+
+    if df_1h.empty:
+        raise ValueError("Sin datos de 1H")
+
+    df_4h = convertir_1h_a_4h(df_1h)
+
+    if df_4h.empty:
+        raise ValueError("No fue posible calcular las velas 4H")
+
+    df_diario = calcular_indicadores(df_diario)
+    df_1h = calcular_indicadores(df_1h)
+    df_4h = calcular_indicadores(df_4h)
+
+    df_diario = df_diario.dropna().reset_index(drop=True)
+    df_1h = df_1h.dropna().reset_index(drop=True)
+    df_4h = df_4h.dropna().reset_index(drop=True)
+
+    if len(df_diario) < 60:
+        raise ValueError("Datos diarios insuficientes")
+
+    if len(df_1h) < 50:
+        raise ValueError("Datos 1H insuficientes")
+
+    if len(df_4h) < 50:
+        raise ValueError("Datos 4H insuficientes")
+
+    actual_d = df_diario.iloc[-1]
+    anterior_d = df_diario.iloc[-2]
+    anterior_2d = df_diario.iloc[-3]
+
+    actual_1h = df_1h.iloc[-1]
+    actual_4h = df_4h.iloc[-1]
+
+    # --------------------------------------------------------
+    # VALORES DIARIOS
+    # --------------------------------------------------------
+
+    precio = float(actual_d["Close"])
+
+    ema10_d = float(actual_d["EMA10"])
+    ema20_d = float(actual_d["EMA20"])
+    ema50_d = float(actual_d["EMA50"])
+
+    rsi_d = float(actual_d["RSI14"])
+
+    macd_d = float(actual_d["MACD"])
+    signal_d = float(actual_d["MACD_SIGNAL"])
+    hist_d = float(actual_d["MACD_HIST"])
+
+    hist_d_anterior = float(
+        anterior_d["MACD_HIST"]
     )
 
-    df_1h = yf.download(
-        ticker,
-        period="60d",
-        interval="1h",
-        auto_adjust=True,
-        progress=False,
-        prepost=False
+    hist_d_anterior_2 = float(
+        anterior_2d["MACD_HIST"]
     )
 
+    volumen = float(actual_d["Volume"])
+    volumen_anterior = float(anterior_d["Volume"])
+    volumen_promedio = float(actual_d["VOL_AVG20"])
+    volumen_relativo = float(actual_d["VOL_REL"])
 
-# ============================================================
-# VALIDACIÓN DE DATOS
-# ============================================================
+    high_10 = float(actual_d["HIGH_10"])
+    low_10 = float(actual_d["LOW_10"])
 
-if df_diario.empty:
-    st.error(
-        "No se pudieron obtener datos diarios."
-    )
-    st.stop()
+    atr14 = float(actual_d["ATR14"])
+    atr_pct = float(actual_d["ATR_PCT"])
 
-if df_1h.empty:
-    st.error(
-        "No se pudieron obtener datos intradía de 1H."
-    )
-    st.stop()
+    # --------------------------------------------------------
+    # SCORE DE TENDENCIA — 25
+    # --------------------------------------------------------
 
-df_diario = limpiar_columnas_yfinance(
-    df_diario
-).reset_index()
+    score_tendencia = 0
 
-df_1h = limpiar_columnas_yfinance(
-    df_1h
-).reset_index()
+    cond_precio_ema50 = precio > ema50_d
+    cond_ema10_ema20 = ema10_d > ema20_d
+    cond_ema20_ema50 = ema20_d > ema50_d
 
-df_4h = convertir_1h_a_4h(
-    df_1h
-)
+    if cond_precio_ema50:
+        score_tendencia += 9
 
+    if cond_ema10_ema20:
+        score_tendencia += 8
 
-# ============================================================
-# CALCULAR INDICADORES
-# ============================================================
+    if cond_ema20_ema50:
+        score_tendencia += 8
 
-df_diario = calcular_indicadores(
-    df_diario
-)
+    # --------------------------------------------------------
+    # SCORE MACD — 20
+    # --------------------------------------------------------
 
-df_1h = calcular_indicadores(
-    df_1h
-)
+    score_macd = 0
 
-df_4h = calcular_indicadores(
-    df_4h
-)
+    cond_macd_signal = macd_d > signal_d
+    cond_hist_positivo = hist_d > 0
 
-df_diario = (
-    df_diario
-    .dropna()
-    .reset_index(drop=True)
-)
-
-df_1h = (
-    df_1h
-    .dropna()
-    .reset_index(drop=True)
-)
-
-df_4h = (
-    df_4h
-    .dropna()
-    .reset_index(drop=True)
-)
-
-if len(df_diario) < 60:
-    st.error(
-        "No hay suficientes datos diarios."
-    )
-    st.stop()
-
-if len(df_1h) < 50:
-    st.error(
-        "No hay suficientes velas de 1H."
-    )
-    st.stop()
-
-if len(df_4h) < 50:
-    st.error(
-        "No hay suficientes velas de 4H."
-    )
-    st.stop()
-
-
-# ============================================================
-# VALORES ACTUALES
-# ============================================================
-
-daily = df_diario.iloc[-1]
-daily_prev = df_diario.iloc[-2]
-daily_prev2 = df_diario.iloc[-3]
-
-hour_1 = df_1h.iloc[-1]
-hour_4 = df_4h.iloc[-1]
-
-precio_actual = float(
-    daily["Close"]
-)
-
-ema10_d = float(
-    daily["EMA10"]
-)
-
-ema20_d = float(
-    daily["EMA20"]
-)
-
-ema50_d = float(
-    daily["EMA50"]
-)
-
-rsi_d = float(
-    daily["RSI14"]
-)
-
-macd_d = float(
-    daily["MACD"]
-)
-
-macd_signal_d = float(
-    daily["MACD_SIGNAL"]
-)
-
-macd_hist_d = float(
-    daily["MACD_HIST"]
-)
-
-macd_hist_d_prev = float(
-    daily_prev["MACD_HIST"]
-)
-
-macd_hist_d_prev2 = float(
-    daily_prev2["MACD_HIST"]
-)
-
-volumen_actual = float(
-    daily["Volume"]
-)
-
-volumen_anterior = float(
-    daily_prev["Volume"]
-)
-
-volumen_promedio = float(
-    daily["VOL_AVG20"]
-)
-
-volumen_relativo = float(
-    daily["VOL_REL"]
-)
-
-high_10d = float(
-    daily["HIGH_10D"]
-)
-
-low_10d = float(
-    daily["LOW_10D"]
-)
-
-atr14 = float(
-    daily["ATR14"]
-)
-
-atr_pct = float(
-    daily["ATR_PCT"]
-)
-
-
-# ============================================================
-# 1. SCORE DE TENDENCIA DIARIA — 25 PUNTOS
-# ============================================================
-
-score_tendencia = 0
-
-cond_precio_sobre_ema50 = (
-    precio_actual > ema50_d
-)
-
-cond_ema10_sobre_ema20 = (
-    ema10_d > ema20_d
-)
-
-cond_ema20_sobre_ema50 = (
-    ema20_d > ema50_d
-)
-
-if cond_precio_sobre_ema50:
-    score_tendencia += 9
-
-if cond_ema10_sobre_ema20:
-    score_tendencia += 8
-
-if cond_ema20_sobre_ema50:
-    score_tendencia += 8
-
-
-# ============================================================
-# 2. SCORE MACD DIARIO — 20 PUNTOS
-# ============================================================
-
-score_macd = 0
-
-cond_macd_sobre_signal = (
-    macd_d > macd_signal_d
-)
-
-cond_histograma_positivo = (
-    macd_hist_d > 0
-)
-
-cond_histograma_creciente = (
-    macd_hist_d
-    > macd_hist_d_prev
-    > macd_hist_d_prev2
-)
-
-if cond_macd_sobre_signal:
-    score_macd += 8
-
-if cond_histograma_positivo:
-    score_macd += 8
-
-if cond_histograma_creciente:
-    score_macd += 4
-
-
-# ============================================================
-# 3. SCORE RSI DIARIO — 15 PUNTOS
-# ============================================================
-
-score_rsi = 0
-
-cond_rsi_ideal = (
-    55 <= rsi_d <= 68
-)
-
-cond_rsi_aceptable = (
-    50 <= rsi_d < 55
-    or
-    68 < rsi_d <= 75
-)
-
-if cond_rsi_ideal:
-    score_rsi = 15
-
-elif cond_rsi_aceptable:
-    score_rsi = 8
-
-
-# ============================================================
-# 4. SCORE VOLUMEN DIARIO — 15 PUNTOS
-# ============================================================
-
-score_volumen = 0
-
-cond_volumen_sobre_promedio = (
-    volumen_actual > volumen_promedio
-)
-
-cond_volumen_15x = (
-    volumen_actual
-    > 1.5 * volumen_promedio
-)
-
-cond_vela_alcista_volumen = (
-    daily["Close"] > daily["Open"]
-    and
-    volumen_actual > volumen_anterior
-)
-
-if cond_volumen_sobre_promedio:
-    score_volumen += 5
-
-if cond_volumen_15x:
-    score_volumen += 5
-
-if cond_vela_alcista_volumen:
-    score_volumen += 5
-
-
-# ============================================================
-# 5. ACCIÓN DEL PRECIO — 10 PUNTOS
-# ============================================================
-
-score_precio = 0
-
-cond_breakout_10d = (
-    precio_actual > high_10d
-)
-
-rango_diario = float(
-    daily["High"] - daily["Low"]
-)
-
-if rango_diario > 0:
-    posicion_cierre = (
-        float(daily["Close"] - daily["Low"])
-        / rango_diario
-    )
-else:
-    posicion_cierre = 0
-
-cond_cierre_tercio_superior = (
-    posicion_cierre >= 0.66
-)
-
-if cond_breakout_10d:
-    score_precio += 5
-
-if cond_cierre_tercio_superior:
-    score_precio += 5
-
-
-# ============================================================
-# 6. CONFIRMACIÓN 4H — 10 PUNTOS
-# ============================================================
-
-score_4h = 0
-
-precio_4h = float(
-    hour_4["Close"]
-)
-
-ema10_4h = float(
-    hour_4["EMA10"]
-)
-
-ema20_4h = float(
-    hour_4["EMA20"]
-)
-
-macd_hist_4h = float(
-    hour_4["MACD_HIST"]
-)
-
-cond_precio_sobre_ema20_4h = (
-    precio_4h > ema20_4h
-)
-
-cond_ema10_sobre_ema20_4h = (
-    ema10_4h > ema20_4h
-)
-
-cond_macd_hist_positivo_4h = (
-    macd_hist_4h > 0
-)
-
-if cond_precio_sobre_ema20_4h:
-    score_4h += 4
-
-if cond_ema10_sobre_ema20_4h:
-    score_4h += 3
-
-if cond_macd_hist_positivo_4h:
-    score_4h += 3
-
-
-# ============================================================
-# 7. CONFIRMACIÓN 1H — 5 PUNTOS
-# ============================================================
-
-score_1h = 0
-
-precio_1h = float(
-    hour_1["Close"]
-)
-
-ema20_1h = float(
-    hour_1["EMA20"]
-)
-
-rsi_1h = float(
-    hour_1["RSI14"]
-)
-
-macd_hist_1h = float(
-    hour_1["MACD_HIST"]
-)
-
-cond_precio_sobre_ema20_1h = (
-    precio_1h > ema20_1h
-)
-
-cond_rsi_1h = (
-    50 <= rsi_1h <= 70
-)
-
-cond_macd_hist_positivo_1h = (
-    macd_hist_1h > 0
-)
-
-if cond_precio_sobre_ema20_1h:
-    score_1h += 2
-
-if cond_rsi_1h:
-    score_1h += 2
-
-if cond_macd_hist_positivo_1h:
-    score_1h += 1
-
-
-# ============================================================
-# SCORE TOTAL
-# ============================================================
-
-score_diario = (
-    score_tendencia
-    + score_macd
-    + score_rsi
-    + score_volumen
-    + score_precio
-)
-
-score_total = (
-    score_diario
-    + score_4h
-    + score_1h
-)
-
-
-# ============================================================
-# ENTRADA, STOP LOSS Y OBJETIVOS
-# ============================================================
-
-entrada_sugerida = max(
-    precio_actual,
-    high_10d
-)
-
-stop_por_atr = (
-    entrada_sugerida
-    - 2 * atr14
-)
-
-stop_maximo_5pct = (
-    entrada_sugerida
-    * 0.95
-)
-
-niveles_stop = [
-    stop_por_atr,
-    stop_maximo_5pct
-]
-
-if (
-    low_10d < entrada_sugerida
-    and
-    low_10d >= entrada_sugerida * 0.90
-):
-    niveles_stop.append(
-        low_10d
+    cond_hist_creciente = (
+        hist_d
+        > hist_d_anterior
+        > hist_d_anterior_2
     )
 
-stop_loss = max(
-    niveles_stop
-)
+    if cond_macd_signal:
+        score_macd += 8
 
-riesgo_unitario = (
-    entrada_sugerida
-    - stop_loss
-)
+    if cond_hist_positivo:
+        score_macd += 8
 
-if riesgo_unitario > 0:
-    riesgo_pct = (
-        riesgo_unitario
-        / entrada_sugerida
-    ) * 100
+    if cond_hist_creciente:
+        score_macd += 4
 
-    tp_2r = (
-        entrada_sugerida
-        + 2 * riesgo_unitario
+    # --------------------------------------------------------
+    # SCORE RSI — 15
+    # --------------------------------------------------------
+
+    score_rsi = 0
+
+    if 55 <= rsi_d <= 68:
+        score_rsi = 15
+
+    elif (
+        50 <= rsi_d < 55
+        or
+        68 < rsi_d <= 75
+    ):
+        score_rsi = 8
+
+    # --------------------------------------------------------
+    # SCORE VOLUMEN — 15
+    # --------------------------------------------------------
+
+    score_volumen = 0
+
+    cond_volumen_promedio = (
+        volumen > volumen_promedio
     )
 
-    tp_3r = (
-        entrada_sugerida
-        + 3 * riesgo_unitario
+    cond_volumen_15 = (
+        volumen > 1.5 * volumen_promedio
     )
 
-else:
-    riesgo_pct = np.nan
-    tp_2r = np.nan
-    tp_3r = np.nan
+    cond_vela_volumen = (
+        actual_d["Close"] > actual_d["Open"]
+        and
+        volumen > volumen_anterior
+    )
+
+    if cond_volumen_promedio:
+        score_volumen += 5
+
+    if cond_volumen_15:
+        score_volumen += 5
+
+    if cond_vela_volumen:
+        score_volumen += 5
+
+    # --------------------------------------------------------
+    # SCORE ACCIÓN DEL PRECIO — 10
+    # --------------------------------------------------------
+
+    score_precio = 0
+
+    cond_breakout = precio > high_10
+
+    rango_diario = float(
+        actual_d["High"] - actual_d["Low"]
+    )
+
+    if rango_diario > 0:
+        posicion_cierre = (
+            float(
+                actual_d["Close"]
+                - actual_d["Low"]
+            )
+            / rango_diario
+        )
+    else:
+        posicion_cierre = 0
+
+    cond_cierre_superior = (
+        posicion_cierre >= 0.66
+    )
+
+    if cond_breakout:
+        score_precio += 5
+
+    if cond_cierre_superior:
+        score_precio += 5
+
+    # --------------------------------------------------------
+    # CONFIRMACIÓN 4H — 10
+    # --------------------------------------------------------
+
+    precio_4h = float(actual_4h["Close"])
+    ema10_4h = float(actual_4h["EMA10"])
+    ema20_4h = float(actual_4h["EMA20"])
+    hist_4h = float(actual_4h["MACD_HIST"])
+    rsi_4h = float(actual_4h["RSI14"])
+
+    score_4h = 0
+
+    cond_precio_ema20_4h = (
+        precio_4h > ema20_4h
+    )
+
+    cond_ema10_ema20_4h = (
+        ema10_4h > ema20_4h
+    )
+
+    cond_hist_positivo_4h = (
+        hist_4h > 0
+    )
+
+    if cond_precio_ema20_4h:
+        score_4h += 4
+
+    if cond_ema10_ema20_4h:
+        score_4h += 3
+
+    if cond_hist_positivo_4h:
+        score_4h += 3
+
+    # --------------------------------------------------------
+    # CONFIRMACIÓN 1H — 5
+    # --------------------------------------------------------
+
+    precio_1h = float(actual_1h["Close"])
+    ema20_1h = float(actual_1h["EMA20"])
+    rsi_1h = float(actual_1h["RSI14"])
+    hist_1h = float(actual_1h["MACD_HIST"])
+
+    score_1h = 0
+
+    cond_precio_ema20_1h = (
+        precio_1h > ema20_1h
+    )
+
+    cond_rsi_1h = (
+        50 <= rsi_1h <= 70
+    )
+
+    cond_hist_positivo_1h = (
+        hist_1h > 0
+    )
+
+    if cond_precio_ema20_1h:
+        score_1h += 2
+
+    if cond_rsi_1h:
+        score_1h += 2
+
+    if cond_hist_positivo_1h:
+        score_1h += 1
+
+    # --------------------------------------------------------
+    # SCORE TOTAL
+    # --------------------------------------------------------
+
+    score_diario = (
+        score_tendencia
+        + score_macd
+        + score_rsi
+        + score_volumen
+        + score_precio
+    )
+
+    score_total = (
+        score_diario
+        + score_4h
+        + score_1h
+    )
+
+    # --------------------------------------------------------
+    # ENTRADA, STOP LOSS Y OBJETIVOS
+    # --------------------------------------------------------
+
+    entrada = max(
+        precio,
+        high_10
+    )
+
+    stop_atr = (
+        entrada - 2 * atr14
+    )
+
+    stop_5pct = (
+        entrada * 0.95
+    )
+
+    stops_validos = [
+        stop_atr,
+        stop_5pct
+    ]
+
+    if (
+        low_10 < entrada
+        and
+        low_10 >= entrada * 0.90
+    ):
+        stops_validos.append(low_10)
+
+    stop_loss = max(stops_validos)
+
+    riesgo_unitario = (
+        entrada - stop_loss
+    )
+
+    if riesgo_unitario > 0:
+        riesgo_pct = (
+            riesgo_unitario / entrada
+        ) * 100
+
+        objetivo_2r = (
+            entrada
+            + 2 * riesgo_unitario
+        )
+
+        objetivo_3r = (
+            entrada
+            + 3 * riesgo_unitario
+        )
+
+    else:
+        riesgo_pct = np.nan
+        objetivo_2r = np.nan
+        objetivo_3r = np.nan
+
+    # --------------------------------------------------------
+    # DECISIÓN
+    # --------------------------------------------------------
+
+    if (
+        score_total >= 90
+        and
+        score_4h >= 8
+        and
+        score_1h >= 4
+    ):
+        decision = "COMPRA AGRESIVA"
+
+    elif (
+        score_total >= 80
+        and
+        score_4h >= 7
+        and
+        score_1h >= 3
+    ):
+        decision = "COMPRAR"
+
+    elif score_total >= 70:
+        decision = "MANTENER / WATCHLIST"
+
+    else:
+        decision = "NO COMPRAR"
+
+    # --------------------------------------------------------
+    # NOTAS
+    # --------------------------------------------------------
+
+    notas = []
+
+    if not cond_precio_ema50:
+        notas.append("Precio bajo EMA50")
+
+    if not cond_ema10_ema20:
+        notas.append("EMA10 bajo EMA20")
+
+    if not cond_macd_signal:
+        notas.append("MACD bajo Signal")
+
+    if not cond_hist_positivo:
+        notas.append("Histograma diario negativo")
+
+    if volumen_relativo < 1:
+        notas.append("Volumen bajo")
+
+    if not cond_breakout:
+        notas.append("Sin breakout 10D")
+
+    if score_4h < 7:
+        notas.append("Confirmación 4H débil")
+
+    if score_1h < 3:
+        notas.append("Confirmación 1H débil")
+
+    if not notas:
+        texto_notas = "Setup completo"
+
+    else:
+        texto_notas = "; ".join(
+            notas[:4]
+        )
+
+    return {
+        "Ticker": ticker,
+        "Decisión": decision,
+        "Score total": int(score_total),
+        "Score diario": int(score_diario),
+        "Score 4H": int(score_4h),
+        "Score 1H": int(score_1h),
+        "Precio": round(precio, 2),
+        "Entrada": round(entrada, 2),
+        "Stop loss": round(stop_loss, 2),
+        "Riesgo %": round(riesgo_pct, 2),
+        "TP 2R": round(objetivo_2r, 2),
+        "TP 3R": round(objetivo_3r, 2),
+        "EMA10 D": round(ema10_d, 2),
+        "EMA20 D": round(ema20_d, 2),
+        "EMA50 D": round(ema50_d, 2),
+        "RSI D": round(rsi_d, 2),
+        "MACD D": round(macd_d, 4),
+        "Signal D": round(signal_d, 4),
+        "Hist MACD D": round(hist_d, 4),
+        "Vol/Avg20": round(volumen_relativo, 2),
+        "ATR14": round(atr14, 2),
+        "ATR %": round(atr_pct, 2),
+        "RSI 4H": round(rsi_4h, 2),
+        "Hist MACD 4H": round(hist_4h, 4),
+        "RSI 1H": round(rsi_1h, 2),
+        "Hist MACD 1H": round(hist_1h, 4),
+        "Notas": texto_notas
+    }
 
 
 # ============================================================
-# DECISIÓN FINAL
+# INTERFAZ DEL SCANNER
 # ============================================================
 
-if (
-    score_total >= 90
-    and
-    score_4h >= 8
-    and
-    score_1h >= 4
-):
-    decision = "COMPRA AGRESIVA"
+with st.sidebar:
 
-elif (
-    score_total >= 80
-    and
-    score_4h >= 7
-    and
-    score_1h >= 3
-):
-    decision = "COMPRAR"
+    st.header("Configuración")
 
-elif score_total >= 70:
-    decision = "MANTENER / WATCHLIST"
-
-else:
-    decision = "NO COMPRAR"
-
-
-# ============================================================
-# RESUMEN PRINCIPAL
-# ============================================================
-
-st.subheader(
-    f"Resumen de {ticker}"
-)
-
-col1, col2, col3, col4 = st.columns(4)
-
-with col1:
-    st.metric(
-        "Decisión",
-        decision
+    tickers_texto = st.text_area(
+        "Tickers separados por coma",
+        value=", ".join(TICKERS_PREDETERMINADOS),
+        height=180
     )
 
-with col2:
-    st.metric(
-        "Score total",
-        f"{score_total}/100"
+    score_minimo = st.slider(
+        "Score mínimo para candidatos",
+        min_value=0,
+        max_value=100,
+        value=70
     )
 
-with col3:
-    st.metric(
-        "Score diario",
-        f"{score_diario}/85"
+    mostrar_no_compra = st.checkbox(
+        "Mostrar acciones con score bajo",
+        value=True
     )
 
-with col4:
-    st.metric(
-        "Precio actual",
-        f"${precio_actual:.2f}"
+    pausa_llamadas = st.number_input(
+        "Pausa entre tickers",
+        min_value=0.0,
+        max_value=5.0,
+        value=0.3,
+        step=0.1,
+        help="Ayuda a evitar bloqueos temporales de Yahoo Finance."
     )
 
-col5, col6, col7, col8 = st.columns(4)
-
-with col5:
-    st.metric(
-        "Entrada sugerida",
-        f"${entrada_sugerida:.2f}"
-    )
-
-with col6:
-    st.metric(
-        "Stop loss",
-        f"${stop_loss:.2f}"
-    )
-
-with col7:
-    st.metric(
-        "Riesgo",
-        f"{riesgo_pct:.2f}%"
-    )
-
-with col8:
-    st.metric(
-        "ATR diario",
-        f"{atr_pct:.2f}%"
-    )
-
-col9, col10, col11, col12 = st.columns(4)
-
-with col9:
-    st.metric(
-        "Objetivo 2R",
-        f"${tp_2r:.2f}"
-    )
-
-with col10:
-    st.metric(
-        "Objetivo 3R",
-        f"${tp_3r:.2f}"
-    )
-
-with col11:
-    st.metric(
-        "Confirmación 4H",
-        f"{score_4h}/10"
-    )
-
-with col12:
-    st.metric(
-        "Confirmación 1H",
-        f"{score_1h}/5"
-    )
-
-
-# ============================================================
-# SCORE POR MÓDULO
-# ============================================================
-
-st.subheader(
-    "🎯 Puntuación por módulo"
-)
-
-s1, s2, s3, s4 = st.columns(4)
-
-with s1:
-    st.metric(
-        "Tendencia diaria",
-        f"{score_tendencia}/25"
-    )
-
-with s2:
-    st.metric(
-        "MACD diario",
-        f"{score_macd}/20"
-    )
-
-with s3:
-    st.metric(
-        "RSI diario",
-        f"{score_rsi}/15"
-    )
-
-with s4:
-    st.metric(
-        "Volumen diario",
-        f"{score_volumen}/15"
-    )
-
-s5, s6, s7, s8 = st.columns(4)
-
-with s5:
-    st.metric(
-        "Acción del precio",
-        f"{score_precio}/10"
-    )
-
-with s6:
-    st.metric(
-        "Confirmación 4H",
-        f"{score_4h}/10"
-    )
-
-with s7:
-    st.metric(
-        "Confirmación 1H",
-        f"{score_1h}/5"
-    )
-
-with s8:
-    st.metric(
-        "Total",
-        f"{score_total}/100"
-    )
-
-
-# ============================================================
-# VALIDACIÓN DIARIA
-# ============================================================
-
-st.subheader(
-    "📋 Validación de la tesis diaria"
-)
-
-st.write(
-    f"Precio ${precio_actual:.2f} > "
-    f"EMA50 ${ema50_d:.2f}: "
-    f"{'✅' if cond_precio_sobre_ema50 else '❌'}"
-)
-
-st.write(
-    f"EMA10 ${ema10_d:.2f} > "
-    f"EMA20 ${ema20_d:.2f}: "
-    f"{'✅' if cond_ema10_sobre_ema20 else '❌'}"
-)
-
-st.write(
-    f"EMA20 ${ema20_d:.2f} > "
-    f"EMA50 ${ema50_d:.2f}: "
-    f"{'✅' if cond_ema20_sobre_ema50 else '❌'}"
-)
-
-st.write(
-    f"RSI diario {rsi_d:.2f} "
-    f"en zona ideal 55–68: "
-    f"{'✅' if cond_rsi_ideal else '❌'}"
-)
-
-st.write(
-    f"MACD {macd_d:.4f} > "
-    f"Signal {macd_signal_d:.4f}: "
-    f"{'✅' if cond_macd_sobre_signal else '❌'}"
-)
-
-st.write(
-    f"Histograma MACD diario positivo: "
-    f"{'✅' if cond_histograma_positivo else '❌'}"
-)
-
-st.write(
-    f"Histograma MACD creciente durante 3 sesiones: "
-    f"{'✅' if cond_histograma_creciente else '❌'}"
-)
-
-st.write(
-    f"Volumen relativo {volumen_relativo:.2f}x "
-    f"> 1.5x: "
-    f"{'✅' if cond_volumen_15x else '❌'}"
-)
-
-st.write(
-    f"Breakout sobre máximo de 10 días "
-    f"${high_10d:.2f}: "
-    f"{'✅' if cond_breakout_10d else '❌'}"
-)
-
-st.write(
-    f"Cierre en tercio superior de la vela: "
-    f"{'✅' if cond_cierre_tercio_superior else '❌'}"
-)
-
-
-# ============================================================
-# VALIDACIÓN 4H
-# ============================================================
-
-st.subheader(
-    "🕓 Confirmación intradía 4H"
-)
-
-st.write(
-    f"Precio 4H ${precio_4h:.2f} > "
-    f"EMA20 4H ${ema20_4h:.2f}: "
-    f"{'✅' if cond_precio_sobre_ema20_4h else '❌'}"
-)
-
-st.write(
-    f"EMA10 4H ${ema10_4h:.2f} > "
-    f"EMA20 4H ${ema20_4h:.2f}: "
-    f"{'✅' if cond_ema10_sobre_ema20_4h else '❌'}"
-)
-
-st.write(
-    f"Histograma MACD 4H "
-    f"{macd_hist_4h:.4f} > 0: "
-    f"{'✅' if cond_macd_hist_positivo_4h else '❌'}"
-)
-
-
-# ============================================================
-# VALIDACIÓN 1H
-# ============================================================
-
-st.subheader(
-    "🕐 Confirmación intradía 1H"
-)
-
-st.write(
-    f"Precio 1H ${precio_1h:.2f} > "
-    f"EMA20 1H ${ema20_1h:.2f}: "
-    f"{'✅' if cond_precio_sobre_ema20_1h else '❌'}"
-)
-
-st.write(
-    f"RSI 1H {rsi_1h:.2f} "
-    f"entre 50 y 70: "
-    f"{'✅' if cond_rsi_1h else '❌'}"
-)
-
-st.write(
-    f"Histograma MACD 1H "
-    f"{macd_hist_1h:.4f} > 0: "
-    f"{'✅' if cond_macd_hist_positivo_1h else '❌'}"
-)
-
-
-# ============================================================
-# TABLAS DE DATOS
-# ============================================================
-
-with st.expander(
-    "Ver últimas velas diarias"
-):
-    st.dataframe(
-        df_diario[
-            [
-                "Date",
-                "Open",
-                "High",
-                "Low",
-                "Close",
-                "Volume",
-                "EMA10",
-                "EMA20",
-                "EMA50",
-                "RSI14",
-                "MACD",
-                "MACD_SIGNAL",
-                "MACD_HIST",
-                "VOL_REL",
-                "ATR14",
-                "ATR_PCT"
-            ]
-        ].tail(30),
+    ejecutar = st.button(
+        "🔍 Ejecutar scanner",
+        type="primary",
         use_container_width=True
     )
 
-with st.expander(
-    "Ver últimas velas 4H"
-):
-    st.dataframe(
-        df_4h[
-            [
-                "Datetime",
-                "Open",
-                "High",
-                "Low",
-                "Close",
-                "Volume",
-                "EMA10",
-                "EMA20",
-                "RSI14",
-                "MACD",
-                "MACD_SIGNAL",
-                "MACD_HIST"
-            ]
-        ].tail(30),
-        use_container_width=True
+
+# ============================================================
+# FILA DE CONDICIONES IDEALES
+# ============================================================
+
+fila_ideal = {
+    "Rank": "IDEAL",
+    "Ticker": "—",
+    "Decisión": "COMPRAR",
+    "Score total": "90+",
+    "Score diario": "80+",
+    "Score 4H": "8–10",
+    "Score 1H": "4–5",
+    "Precio": "—",
+    "Entrada": "Breakout 10D",
+    "Stop loss": "2 ATR / swing",
+    "Riesgo %": "3–5%",
+    "TP 2R": "2× riesgo",
+    "TP 3R": "3× riesgo",
+    "EMA10 D": "> EMA20",
+    "EMA20 D": "> EMA50",
+    "EMA50 D": "Precio > EMA50",
+    "RSI D": "55–68",
+    "MACD D": "> Signal",
+    "Signal D": "< MACD",
+    "Hist MACD D": ">0 creciente",
+    "Vol/Avg20": ">1.5x",
+    "ATR14": "—",
+    "ATR %": "2–5%",
+    "RSI 4H": "50–70",
+    "Hist MACD 4H": ">0",
+    "RSI 1H": "50–70",
+    "Hist MACD 1H": ">0",
+    "Notas": "Condiciones ideales"
+}
+
+
+# ============================================================
+# EJECUCIÓN
+# ============================================================
+
+if ejecutar:
+
+    tickers = [
+        ticker.strip().upper()
+        for ticker in tickers_texto.split(",")
+        if ticker.strip()
+    ]
+
+    tickers = list(dict.fromkeys(tickers))
+
+    if not tickers:
+        st.warning(
+            "Agrega al menos un ticker."
+        )
+        st.stop()
+
+    resultados = []
+    errores = []
+
+    barra = st.progress(0)
+    mensaje = st.empty()
+
+    total_tickers = len(tickers)
+
+    for indice, ticker in enumerate(tickers):
+
+        mensaje.write(
+            f"Analizando {ticker} "
+            f"({indice + 1}/{total_tickers})..."
+        )
+
+        try:
+            resultado = analizar_ticker(ticker)
+
+            resultados.append(resultado)
+
+        except Exception as error:
+            errores.append(
+                {
+                    "Ticker": ticker,
+                    "Error": str(error)
+                }
+            )
+
+        barra.progress(
+            (indice + 1) / total_tickers
+        )
+
+        if pausa_llamadas > 0:
+            time.sleep(pausa_llamadas)
+
+    mensaje.success(
+        "Scanner terminado."
     )
 
-with st.expander(
-    "Ver últimas velas 1H"
-):
-    columna_fecha_1h = (
-        "Datetime"
-        if "Datetime" in df_1h.columns
-        else "Date"
+    if not resultados:
+        st.error(
+            "No fue posible analizar ningún ticker."
+        )
+
+        if errores:
+            st.dataframe(
+                pd.DataFrame(errores),
+                use_container_width=True
+            )
+
+        st.stop()
+
+    df_resultados = pd.DataFrame(
+        resultados
+    )
+
+    df_resultados = df_resultados.sort_values(
+        by=[
+            "Score total",
+            "Score 4H",
+            "Score 1H",
+            "Vol/Avg20"
+        ],
+        ascending=[
+            False,
+            False,
+            False,
+            False
+        ]
+    ).reset_index(drop=True)
+
+    df_resultados.insert(
+        0,
+        "Rank",
+        range(1, len(df_resultados) + 1)
+    )
+
+    if not mostrar_no_compra:
+        df_resultados = df_resultados[
+            df_resultados["Score total"]
+            >= score_minimo
+        ].copy()
+
+    candidatos = df_resultados[
+        df_resultados["Score total"]
+        >= score_minimo
+    ].copy()
+
+    # --------------------------------------------------------
+    # MÉTRICAS GENERALES
+    # --------------------------------------------------------
+
+    st.subheader(
+        "Resumen del scanner"
+    )
+
+    m1, m2, m3, m4 = st.columns(4)
+
+    with m1:
+        st.metric(
+            "Acciones analizadas",
+            len(resultados)
+        )
+
+    with m2:
+        st.metric(
+            "Candidatos",
+            len(candidatos)
+        )
+
+    with m3:
+        compras = df_resultados[
+            df_resultados["Decisión"].isin(
+                [
+                    "COMPRA AGRESIVA",
+                    "COMPRAR"
+                ]
+            )
+        ]
+
+        st.metric(
+            "Señales de compra",
+            len(compras)
+        )
+
+    with m4:
+        mejor_score = (
+            int(df_resultados["Score total"].max())
+            if not df_resultados.empty
+            else 0
+        )
+
+        st.metric(
+            "Mejor score",
+            f"{mejor_score}/100"
+        )
+
+    # --------------------------------------------------------
+    # TABLA DE CANDIDATOS
+    # --------------------------------------------------------
+
+    st.subheader(
+        "✅ Candidatos por score"
+    )
+
+    if candidatos.empty:
+        st.warning(
+            "No hay acciones que superen "
+            "el score mínimo seleccionado."
+        )
+
+    else:
+        tabla_candidatos = pd.concat(
+            [
+                pd.DataFrame([fila_ideal]),
+                candidatos
+            ],
+            ignore_index=True
+        )
+
+        st.dataframe(
+            tabla_candidatos,
+            use_container_width=True,
+            hide_index=True
+        )
+
+    # --------------------------------------------------------
+    # TABLA COMPLETA
+    # --------------------------------------------------------
+
+    st.subheader(
+        "📋 Ranking completo"
+    )
+
+    tabla_completa = pd.concat(
+        [
+            pd.DataFrame([fila_ideal]),
+            df_resultados
+        ],
+        ignore_index=True
     )
 
     st.dataframe(
-        df_1h[
-            [
-                columna_fecha_1h,
-                "Open",
-                "High",
-                "Low",
-                "Close",
-                "Volume",
-                "EMA10",
-                "EMA20",
-                "RSI14",
-                "MACD",
-                "MACD_SIGNAL",
-                "MACD_HIST"
+        tabla_completa,
+        use_container_width=True,
+        hide_index=True
+    )
+
+    # --------------------------------------------------------
+    # DESCARGA CSV
+    # --------------------------------------------------------
+
+    csv = df_resultados.to_csv(
+        index=False
+    ).encode("utf-8")
+
+    st.download_button(
+        label="⬇️ Descargar resultados CSV",
+        data=csv,
+        file_name="swing_scanner_resultados.csv",
+        mime="text/csv"
+    )
+
+    # --------------------------------------------------------
+    # ERRORES
+    # --------------------------------------------------------
+
+    if errores:
+
+        with st.expander(
+            "Ver tickers con errores"
+        ):
+            st.dataframe(
+                pd.DataFrame(errores),
+                use_container_width=True,
+                hide_index=True
+            )
+
+
+# ============================================================
+# INFORMACIÓN DE LA ESTRATEGIA
+# ============================================================
+
+else:
+
+    st.info(
+        "Configura la lista de tickers y presiona "
+        "“Ejecutar scanner”."
+    )
+
+    st.subheader(
+        "Sistema de puntuación"
+    )
+
+    tabla_pesos = pd.DataFrame(
+        {
+            "Módulo": [
+                "Tendencia diaria",
+                "MACD diario",
+                "RSI diario",
+                "Volumen diario",
+                "Acción del precio",
+                "Confirmación 4H",
+                "Confirmación 1H"
+            ],
+            "Puntos": [
+                PESO_TENDENCIA,
+                PESO_MACD,
+                PESO_RSI,
+                PESO_VOLUMEN,
+                PESO_PRECIO,
+                PESO_4H,
+                PESO_1H
             ]
-        ].tail(30),
-        use_container_width=True
+        }
+    )
+
+    st.dataframe(
+        tabla_pesos,
+        use_container_width=True,
+        hide_index=True
     )
 
 
@@ -1132,6 +1131,8 @@ st.divider()
 
 st.caption(
     "Herramienta educativa de análisis técnico. "
-    "La confirmación intradía de yfinance puede tener retraso "
-    "y no debe considerarse una señal de ejecución en tiempo real."
+    "Los datos de Yahoo Finance pueden tener retraso. "
+    "Una puntuación alta no garantiza beneficios. "
+    "Revisa noticias, resultados trimestrales, liquidez "
+    "y riesgo antes de ejecutar una operación."
 )
