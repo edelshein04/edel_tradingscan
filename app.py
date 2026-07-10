@@ -32,6 +32,11 @@ st.caption(
 # ============================================================
 
 NASDAQ_SYMBOL_URL = (
+    "https://www.nasdaqtrader.com/"
+    "dynamic/symdir/nasdaqlisted.txt"
+)
+
+NASDAQ_SYMBOL_URL_BACKUP = (
     "https://ftp.nasdaqtrader.com/"
     "SymbolDirectory/nasdaqlisted.txt"
 )
@@ -115,55 +120,133 @@ def limpiar_columnas_yfinance(df):
 def obtener_nasdaq():
     """
     Obtiene el directorio oficial de valores listados en Nasdaq.
-    Excluye ETF y símbolos de prueba.
+
+    Usa una URL principal, una URL de respaldo, reintentos y tiempos
+    de espera más amplios para evitar que un fallo temporal detenga
+    la aplicación.
     """
 
+    urls_nasdaq = [
+        NASDAQ_SYMBOL_URL,
+        NASDAQ_SYMBOL_URL_BACKUP
+    ]
+
     headers = {
-        "User-Agent": "Mozilla/5.0"
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/124.0 Safari/537.36"
+        ),
+        "Accept": "text/plain,text/html,*/*",
+        "Connection": "close"
     }
 
-    response = requests.get(
-        NASDAQ_SYMBOL_URL,
-        headers=headers,
-        timeout=30
-    )
+    contenido = None
+    errores_descarga = []
 
-    response.raise_for_status()
+    session = requests.Session()
 
-    contenido = response.text
+    for url in urls_nasdaq:
+
+        for intento in range(3):
+
+            try:
+                response = session.get(
+                    url,
+                    headers=headers,
+                    timeout=(15, 90)
+                )
+
+                response.raise_for_status()
+
+                texto = response.text.strip()
+
+                if (
+                    "Symbol|Security Name" in texto
+                    and len(texto) > 1000
+                ):
+                    contenido = texto
+                    break
+
+                errores_descarga.append(
+                    f"{url}: contenido inválido"
+                )
+
+            except requests.exceptions.Timeout:
+                errores_descarga.append(
+                    f"{url}: timeout en intento {intento + 1}"
+                )
+
+            except requests.exceptions.RequestException as error:
+                errores_descarga.append(
+                    f"{url}: {type(error).__name__}: {error}"
+                )
+
+            time.sleep(2 * (intento + 1))
+
+        if contenido is not None:
+            break
+
+    session.close()
+
+    if contenido is None:
+        detalle = " | ".join(
+            errores_descarga[-6:]
+        )
+
+        raise RuntimeError(
+            "No fue posible descargar el directorio Nasdaq. "
+            f"Detalles: {detalle}"
+        )
 
     nasdaq = pd.read_csv(
         io.StringIO(contenido),
-        sep="|"
+        sep="|",
+        dtype=str
     )
+
+    if "Symbol" not in nasdaq.columns:
+        raise RuntimeError(
+            "El archivo Nasdaq no contiene la columna Symbol."
+        )
 
     nasdaq["Symbol"] = (
         nasdaq["Symbol"]
         .astype(str)
         .str.strip()
+        .str.upper()
     )
 
-    # Eliminar línea final del archivo
+    # Eliminar la línea final del archivo.
     nasdaq = nasdaq[
         ~nasdaq["Symbol"].str.contains(
-            "File Creation Time",
+            "FILE CREATION TIME",
+            case=False,
             na=False
         )
     ].copy()
 
-    # Excluir ETF
+    # Excluir ETF.
     if "ETF" in nasdaq.columns:
         nasdaq = nasdaq[
-            nasdaq["ETF"].astype(str).str.upper() == "N"
+            nasdaq["ETF"]
+            .fillna("")
+            .str.strip()
+            .str.upper()
+            .eq("N")
         ].copy()
 
-    # Excluir símbolos de prueba
+    # Excluir símbolos de prueba.
     if "Test Issue" in nasdaq.columns:
         nasdaq = nasdaq[
-            nasdaq["Test Issue"].astype(str).str.upper() == "N"
+            nasdaq["Test Issue"]
+            .fillna("")
+            .str.strip()
+            .str.upper()
+            .eq("N")
         ].copy()
 
-    # Excluir símbolos incompatibles o especiales
+    # Excluir símbolos especiales incompatibles.
     nasdaq = nasdaq[
         nasdaq["Symbol"].str.match(
             r"^[A-Z]{1,5}$",
@@ -171,18 +254,35 @@ def obtener_nasdaq():
         )
     ].copy()
 
+    columna_empresa = (
+        "Security Name"
+        if "Security Name" in nasdaq.columns
+        else "Symbol"
+    )
+
     resultado = pd.DataFrame({
         "Ticker original": nasdaq["Symbol"],
         "Ticker": nasdaq["Symbol"].apply(
             normalizar_ticker_yahoo
         ),
-        "Empresa": nasdaq["Security Name"],
+        "Empresa": nasdaq[columna_empresa],
         "Origen": "Nasdaq"
     })
 
-    return resultado.drop_duplicates(
+    resultado = resultado.dropna(
         subset=["Ticker"]
-    ).reset_index(drop=True)
+    )
+
+    resultado = resultado[
+        resultado["Ticker"].ne("")
+    ]
+
+    return (
+        resultado
+        .drop_duplicates(subset=["Ticker"])
+        .sort_values("Ticker")
+        .reset_index(drop=True)
+    )
 
 
 # ============================================================
@@ -195,11 +295,47 @@ def obtener_sp500():
     Obtiene la tabla pública de constituyentes del S&P 500.
     """
 
-    tablas = pd.read_html(
-        SP500_URL
-    )
+    headers = {
+        "User-Agent": "Mozilla/5.0"
+    }
+
+    try:
+        response = requests.get(
+            SP500_URL,
+            headers=headers,
+            timeout=(15, 60)
+        )
+
+        response.raise_for_status()
+
+        tablas = pd.read_html(
+            io.StringIO(response.text)
+        )
+
+    except Exception as error:
+        raise RuntimeError(
+            "No fue posible descargar la lista del S&P 500. "
+            f"Detalle: {error}"
+        ) from error
+
+    if not tablas:
+        raise RuntimeError(
+            "Wikipedia no devolvió tablas para el S&P 500."
+        )
 
     sp500 = tablas[0].copy()
+
+    columnas_necesarias = {
+        "Symbol",
+        "Security"
+    }
+
+    if not columnas_necesarias.issubset(
+        sp500.columns
+    ):
+        raise RuntimeError(
+            "La tabla del S&P 500 cambió de formato."
+        )
 
     resultado = pd.DataFrame({
         "Ticker original": sp500["Symbol"],
@@ -222,14 +358,47 @@ def obtener_sp500():
 @st.cache_data(ttl=21600, show_spinner=False)
 def obtener_universo():
     """
-    Combina Nasdaq y S&P 500 y conserva el origen de cada ticker.
+    Combina Nasdaq y S&P 500.
+
+    Si una fuente falla temporalmente, continúa con la otra fuente
+    para que la aplicación no se detenga por completo.
     """
 
-    nasdaq = obtener_nasdaq()
-    sp500 = obtener_sp500()
+    fuentes = []
+    errores = []
+
+    try:
+        fuentes.append(
+            obtener_nasdaq()
+        )
+    except Exception as error:
+        errores.append(
+            f"Nasdaq: {error}"
+        )
+
+    try:
+        fuentes.append(
+            obtener_sp500()
+        )
+    except Exception as error:
+        errores.append(
+            f"S&P 500: {error}"
+        )
+
+    fuentes_validas = [
+        df
+        for df in fuentes
+        if df is not None and not df.empty
+    ]
+
+    if not fuentes_validas:
+        raise RuntimeError(
+            "No fue posible cargar ninguna fuente del universo. "
+            + " | ".join(errores)
+        )
 
     universo = pd.concat(
-        [nasdaq, sp500],
+        fuentes_validas,
         ignore_index=True
     )
 
@@ -250,6 +419,8 @@ def obtener_universo():
     universo = universo.sort_values(
         "Ticker"
     ).reset_index(drop=True)
+
+    universo.attrs["errores_fuentes"] = errores
 
     return universo
 
@@ -1173,12 +1344,38 @@ if ejecutar:
     with st.spinner(
         "Cargando universo Nasdaq + S&P 500..."
     ):
-        universo = obtener_universo()
+        try:
+            universo = obtener_universo()
+
+        except Exception as error:
+            st.error(
+                "No fue posible cargar el universo de acciones."
+            )
+
+            st.warning(
+                "El servidor de Nasdaq o Wikipedia puede estar "
+                "temporalmente ocupado. Intenta nuevamente en unos minutos."
+            )
+
+            st.code(str(error))
+
+            st.stop()
 
     st.success(
         f"Universo cargado: "
         f"{len(universo):,} símbolos únicos."
     )
+
+    errores_fuentes = universo.attrs.get(
+        "errores_fuentes",
+        []
+    )
+
+    if errores_fuentes:
+        st.warning(
+            "El scanner continuará con una fuente parcial: "
+            + " | ".join(errores_fuentes)
+        )
 
     mapa_empresas = universo.set_index(
         "Ticker"
@@ -1192,6 +1389,12 @@ if ejecutar:
             tamano_lote
         )
     )
+
+    if not lotes:
+        st.error(
+            "El universo no contiene símbolos válidos."
+        )
+        st.stop()
 
     resultados_diarios = []
     errores = []
